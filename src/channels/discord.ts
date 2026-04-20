@@ -173,8 +173,11 @@ export class DiscordChannel implements Channel {
       logger.error({ err: err.message }, 'Discord client error');
     });
 
-    return new Promise<void>((resolve) => {
+    return new Promise<void>((resolve, reject) => {
+      let settled = false;
       this.client!.once(Events.ClientReady, (readyClient) => {
+        if (settled) return;
+        settled = true;
         logger.info(
           { username: readyClient.user.tag, id: readyClient.user.id },
           'Discord bot connected',
@@ -186,7 +189,12 @@ export class DiscordChannel implements Channel {
         resolve();
       });
 
-      this.client!.login(this.botToken);
+      void Promise.resolve(this.client!.login(this.botToken)).catch((err) => {
+        if (settled) return;
+        settled = true;
+        this.client = null;
+        reject(err);
+      });
     });
   }
 

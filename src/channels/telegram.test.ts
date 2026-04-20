@@ -36,6 +36,9 @@ vi.mock('../group-folder.js', () => ({
 type Handler = (...args: any[]) => any;
 
 const botRef = vi.hoisted(() => ({ current: null as any }));
+const telegramStartErrorRef = vi.hoisted(() => ({
+  current: null as Error | null,
+}));
 
 vi.mock('grammy', () => ({
   Bot: class MockBot {
@@ -70,6 +73,9 @@ vi.mock('grammy', () => ({
     }
 
     start(opts: { onStart: (botInfo: any) => void }) {
+      if (telegramStartErrorRef.current) {
+        throw telegramStartErrorRef.current;
+      }
       opts.onStart({ username: 'andy_ai_bot', id: 12345 });
     }
 
@@ -112,6 +118,7 @@ function createTextCtx(overrides: {
   date?: number;
   entities?: any[];
   reply_to_message?: any;
+  message_thread_id?: number;
 }) {
   const chatId = overrides.chatId ?? 100200300;
   const chatType = overrides.chatType ?? 'group';
@@ -132,6 +139,7 @@ function createTextCtx(overrides: {
       message_id: overrides.messageId ?? 1,
       entities: overrides.entities ?? [],
       reply_to_message: overrides.reply_to_message,
+      message_thread_id: overrides.message_thread_id,
     },
     me: { username: 'andy_ai_bot' },
     reply: vi.fn(),
@@ -195,6 +203,7 @@ const flushPromises = () => new Promise((resolve) => setTimeout(resolve, 0));
 describe('TelegramChannel', () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    telegramStartErrorRef.current = null;
 
     // Mock fs operations used by downloadFile
     vi.spyOn(fs, 'mkdirSync').mockReturnValue(undefined);
@@ -272,6 +281,15 @@ describe('TelegramChannel', () => {
 
       expect(channel.isConnected()).toBe(false);
     });
+
+    it('rejects connect() when bot startup throws', async () => {
+      const opts = createTestOpts();
+      const channel = new TelegramChannel('test-token', opts);
+      telegramStartErrorRef.current = new Error('startup failed');
+
+      await expect(channel.connect()).rejects.toThrow('startup failed');
+      expect(channel.isConnected()).toBe(false);
+    });
   });
 
   // --- Text message handling ---
@@ -315,6 +333,27 @@ describe('TelegramChannel', () => {
 
       expect(opts.onChatMetadata).toHaveBeenCalledWith(
         'tg:999999',
+        expect.any(String),
+        'Test Group',
+        'telegram',
+        true,
+      );
+      expect(opts.onMessage).not.toHaveBeenCalled();
+    });
+
+    it('ignores forum topic messages until thread-aware routing is implemented', async () => {
+      const opts = createTestOpts();
+      const channel = new TelegramChannel('test-token', opts);
+      await channel.connect();
+
+      const ctx = createTextCtx({
+        text: 'Topic-scoped message',
+        message_thread_id: 42,
+      });
+      await triggerTextMessage(ctx);
+
+      expect(opts.onChatMetadata).toHaveBeenCalledWith(
+        'tg:100200300',
         expect.any(String),
         'Test Group',
         'telegram',
@@ -893,6 +932,13 @@ describe('TelegramChannel', () => {
       await triggerMediaMessage('message:photo', ctx);
       await flushPromises();
 
+      expect(opts.onChatMetadata).toHaveBeenCalledWith(
+        'tg:999999',
+        expect.any(String),
+        undefined,
+        'telegram',
+        true,
+      );
       expect(opts.onMessage).not.toHaveBeenCalled();
     });
 

@@ -51,6 +51,7 @@ export class TelegramChannel implements Channel {
   private bot: Bot | null = null;
   private opts: TelegramChannelOpts;
   private botToken: string;
+  private started = false;
 
   constructor(botToken: string, opts: TelegramChannelOpts) {
     this.botToken = botToken;
@@ -204,6 +205,14 @@ export class TelegramChannel implements Channel {
         isGroup,
       );
 
+      if (threadId !== undefined) {
+        logger.warn(
+          { chatJid, threadId },
+          'Telegram forum topics are not supported yet; ignoring topic message',
+        );
+        return;
+      }
+
       // Only deliver full message for registered groups
       const group = this.opts.registeredGroups()[chatJid];
       if (!group) {
@@ -242,9 +251,6 @@ export class TelegramChannel implements Channel {
       opts?: { fileId?: string; filename?: string },
     ) => {
       const chatJid = `tg:${ctx.chat.id}`;
-      const group = this.opts.registeredGroups()[chatJid];
-      if (!group) return;
-
       const timestamp = new Date(ctx.message.date * 1000).toISOString();
       const senderName =
         ctx.from?.first_name ||
@@ -262,6 +268,20 @@ export class TelegramChannel implements Channel {
         'telegram',
         isGroup,
       );
+
+      if (ctx.message.message_thread_id !== undefined) {
+        logger.warn(
+          {
+            chatJid,
+            threadId: ctx.message.message_thread_id,
+          },
+          'Telegram forum topics are not supported yet; ignoring topic media message',
+        );
+        return;
+      }
+
+      const group = this.opts.registeredGroups()[chatJid];
+      if (!group) return;
 
       const deliver = (content: string) => {
         this.opts.onMessage(chatJid, {
@@ -345,28 +365,42 @@ export class TelegramChannel implements Channel {
     });
 
     // Start polling — returns a Promise that resolves when started
-    return new Promise<void>((resolve) => {
-      this.bot!.start({
-        onStart: (botInfo) => {
-          logger.info(
-            { username: botInfo.username, id: botInfo.id },
-            'Telegram bot connected',
-          );
-          console.log(`\n  Telegram bot: @${botInfo.username}`);
-          console.log(
-            `  Send /chatid to the bot to get a chat's registration ID\n`,
-          );
-          resolve();
-        },
-      });
+    return new Promise<void>((resolve, reject) => {
+      let settled = false;
+      const fail = (err: unknown) => {
+        if (settled) return;
+        settled = true;
+        this.started = false;
+        this.bot = null;
+        reject(err);
+      };
+
+      try {
+        const startResult = this.bot!.start({
+          onStart: (botInfo) => {
+            if (settled) return;
+            settled = true;
+            this.started = true;
+            logger.info(
+              { username: botInfo.username, id: botInfo.id },
+              'Telegram bot connected',
+            );
+            console.log(`\n  Telegram bot: @${botInfo.username}`);
+            console.log(
+              `  Send /chatid to the bot to get a chat's registration ID\n`,
+            );
+            resolve();
+          },
+        });
+
+        void Promise.resolve(startResult).catch(fail);
+      } catch (err) {
+        fail(err);
+      }
     });
   }
 
-  async sendMessage(
-    jid: string,
-    text: string,
-    threadId?: string,
-  ): Promise<void> {
+  async sendMessage(jid: string, text: string): Promise<void> {
     if (!this.bot) {
       logger.warn('Telegram bot not initialized');
       return;
@@ -374,35 +408,28 @@ export class TelegramChannel implements Channel {
 
     try {
       const numericId = jid.replace(/^tg:/, '');
-      const options = threadId
-        ? { message_thread_id: parseInt(threadId, 10) }
-        : {};
 
       // Telegram has a 4096 character limit per message — split if needed
       const MAX_LENGTH = 4096;
       if (text.length <= MAX_LENGTH) {
-        await sendTelegramMessage(this.bot.api, numericId, text, options);
+        await sendTelegramMessage(this.bot.api, numericId, text);
       } else {
         for (let i = 0; i < text.length; i += MAX_LENGTH) {
           await sendTelegramMessage(
             this.bot.api,
             numericId,
             text.slice(i, i + MAX_LENGTH),
-            options,
           );
         }
       }
-      logger.info(
-        { jid, length: text.length, threadId },
-        'Telegram message sent',
-      );
+      logger.info({ jid, length: text.length }, 'Telegram message sent');
     } catch (err) {
       logger.error({ jid, err }, 'Failed to send Telegram message');
     }
   }
 
   isConnected(): boolean {
-    return this.bot !== null;
+    return this.bot !== null && this.started;
   }
 
   ownsJid(jid: string): boolean {
@@ -413,6 +440,7 @@ export class TelegramChannel implements Channel {
     if (this.bot) {
       this.bot.stop();
       this.bot = null;
+      this.started = false;
       logger.info('Telegram bot stopped');
     }
   }

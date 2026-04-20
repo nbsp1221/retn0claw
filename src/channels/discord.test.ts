@@ -29,6 +29,9 @@ vi.mock('../logger.js', () => ({
 type Handler = (...args: any[]) => any;
 
 const clientRef = vi.hoisted(() => ({ current: null as any }));
+const discordLoginErrorRef = vi.hoisted(() => ({
+  current: null as Error | null,
+}));
 
 vi.mock('discord.js', () => {
   const Events = {
@@ -65,6 +68,9 @@ vi.mock('discord.js', () => {
     }
 
     async login(_token: string) {
+      if (discordLoginErrorRef.current) {
+        throw discordLoginErrorRef.current;
+      }
       this._ready = true;
       // Fire the ready event
       const readyHandlers = this.eventHandlers.get('ready') || [];
@@ -193,6 +199,7 @@ async function triggerMessage(message: any) {
 describe('DiscordChannel', () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    discordLoginErrorRef.current = null;
   });
 
   afterEach(() => {
@@ -237,6 +244,15 @@ describe('DiscordChannel', () => {
       const opts = createTestOpts();
       const channel = new DiscordChannel('test-token', opts);
 
+      expect(channel.isConnected()).toBe(false);
+    });
+
+    it('rejects connect() when login fails', async () => {
+      const opts = createTestOpts();
+      const channel = new DiscordChannel('test-token', opts);
+      discordLoginErrorRef.current = new Error('invalid token');
+
+      await expect(channel.connect()).rejects.toThrow('invalid token');
       expect(channel.isConnected()).toBe(false);
     });
   });
