@@ -232,7 +232,6 @@ export class TelegramChannel implements Channel {
         content,
         timestamp,
         is_from_me: false,
-        thread_id: threadId ? threadId.toString() : undefined,
         reply_to_message_id: replyToMessageId,
         reply_to_message_content: replyToContent,
         reply_to_sender_name: replyToSenderName,
