@@ -15,6 +15,7 @@ import {
   TIMEZONE,
 } from './config.js';
 import './channels/index.js';
+import { connectInstalledChannels } from './channels/connect.js';
 import {
   getChannelFactory,
   getRegisteredChannelNames,
@@ -677,19 +678,14 @@ async function main(): Promise<void> {
   // Create and connect all registered channels.
   // Each channel self-registers via the barrel import above.
   // Factories return null when credentials are missing, so unconfigured channels are skipped.
-  for (const channelName of getRegisteredChannelNames()) {
-    const factory = getChannelFactory(channelName)!;
-    const channel = factory(channelOpts);
-    if (!channel) {
-      logger.warn(
-        { channel: channelName },
-        'Channel installed but credentials missing — skipping. Check .env or re-run the channel skill.',
-      );
-      continue;
-    }
-    channels.push(channel);
-    await channel.connect();
-  }
+  channels.push(
+    ...(await connectInstalledChannels({
+      channelNames: getRegisteredChannelNames(),
+      getChannelFactory,
+      channelOpts,
+      warn: logger.warn,
+    })),
+  );
   if (channels.length === 0) {
     logger.fatal('No channels connected');
     process.exit(1);
