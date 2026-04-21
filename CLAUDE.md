@@ -1,80 +1,61 @@
 # retn0claw
 
-Personal fork of NanoClaw under active rebranding and architectural reshaping. See [README.md](README.md) for the current framing of the fork.
+`retn0claw` is a personal fork of NanoClaw and is operated as a personal coding operating system for software project work.
 
-## Quick Context
+Use [README.md](README.md) as the primary identity document. Use the codebase as the source of truth for runtime behavior. Some repository docs are still inherited from NanoClaw and should be treated as reference material unless the current README or code says otherwise.
 
-Single Node.js process with skill-based channel system. Channels (WhatsApp, Telegram, Slack, Discord, Gmail) are skills that self-register at startup. Messages route to Claude Agent SDK running in containers (Linux VMs). Each group has isolated filesystem and memory.
+## Working Assumptions
+
+- Do not assume this repo is trying to be a broad public feature marketplace.
+- Do not assume inherited NanoClaw docs define the long-term direction of the fork.
+- Prefer describing the system as a personal project-work runtime, not a generic assistant product.
+- Keep NanoClaw attribution explicit when rewriting public-facing docs.
 
 ## Key Files
 
 | File | Purpose |
 |------|---------|
-| `src/index.ts` | Orchestrator: state, message loop, agent invocation |
-| `src/channels/registry.ts` | Channel registry (self-registration at startup) |
-| `src/ipc.ts` | IPC watcher and task processing |
-| `src/router.ts` | Message formatting and outbound routing |
-| `src/config.ts` | Trigger pattern, paths, intervals |
-| `src/container-runner.ts` | Spawns agent containers with mounts |
-| `src/task-scheduler.ts` | Runs scheduled tasks |
-| `src/db.ts` | SQLite operations |
-| `groups/{name}/CLAUDE.md` | Per-group memory (isolated) |
-| `container/skills/` | Skills loaded inside agent containers (browser, status, formatting) |
+| `README.md` | Current public-facing identity and scope |
+| `docs/README.md` | Guide to current vs inherited docs |
+| `src/index.ts` | Main orchestrator loop |
+| `src/group-queue.ts` | Per-group execution queue |
+| `src/container-runner.ts` | Container-based agent execution |
+| `src/task-scheduler.ts` | Scheduled task runner |
+| `src/db.ts` | SQLite persistence layer |
+| `groups/*/CLAUDE.md` | Per-group memory and instructions |
 
-## Secrets / Credentials / Proxy (OneCLI)
+## Runtime Notes
 
-API keys, secret keys, OAuth tokens, and auth credentials are managed by the OneCLI gateway — which handles secret injection into containers at request time, so no keys or tokens are ever passed to containers directly. Run `onecli --help`.
+- Single Node.js process orchestrator
+- SQLite for persistent state
+- Container-based isolated agent execution
+- Discord and Telegram integrations are wired into the runtime today
+- OneCLI handles credential routing and agent-vault integration
 
-## Skills
-
-The repo still uses the same four-skill taxonomy inherited from NanoClaw. See [CONTRIBUTING.md](CONTRIBUTING.md) for the current fork's expectations and the inherited skill model.
-
-- **Feature skills** — merge a `skill/*` branch to add capabilities (e.g. `/add-telegram`, `/add-slack`)
-- **Utility skills** — ship code files alongside SKILL.md (e.g. `/claw`)
-- **Operational skills** — instruction-only workflows, always on `main` (e.g. `/setup`, `/debug`)
-- **Container skills** — loaded inside agent containers at runtime (`container/skills/`)
-
-| Skill | When to Use |
-|-------|-------------|
-| `/setup` | First-time installation, authentication, service configuration |
-| `/customize` | Adding channels, integrations, changing behavior |
-| `/debug` | Container issues, logs, troubleshooting |
-| Upstream sync | Bring selected upstream NanoClaw changes into this fork manually |
-| `/init-onecli` | Install OneCLI Agent Vault and migrate `.env` credentials to it |
-| `/qodo-pr-resolver` | Fetch and fix Qodo PR review issues interactively or in batch |
-| `/get-qodo-rules` | Load org- and repo-level coding rules from Qodo before code tasks |
-
-## Contributing
-
-Before creating a PR, adding a skill, or preparing any contribution, you MUST read [CONTRIBUTING.md](CONTRIBUTING.md). It covers accepted change types, the four skill types and their guidelines, SKILL.md format rules, PR requirements, and the pre-submission checklist (searching for existing PRs/issues, testing, description format).
-
-## Development
-
-Run commands directly—don't tell the user to run them.
+## Useful Commands
 
 ```bash
-npm run dev          # Run with hot reload
-npm run build        # Compile TypeScript
-./container/build.sh # Rebuild agent container
+npm run dev
+npm run build
+npm test
+./container/build.sh
 ```
 
 Service management:
+
 ```bash
-# macOS (launchd)
+# macOS
 launchctl load ~/Library/LaunchAgents/com.retn0claw.plist
 launchctl unload ~/Library/LaunchAgents/com.retn0claw.plist
-launchctl kickstart -k gui/$(id -u)/com.retn0claw  # restart
+launchctl kickstart -k gui/$(id -u)/com.retn0claw
 
-# Linux (systemd)
+# Linux user service
 systemctl --user start retn0claw
 systemctl --user stop retn0claw
 systemctl --user restart retn0claw
+
+# WSL / Linux without user systemd
+bash start-retn0claw.sh
 ```
 
-## Troubleshooting
-
-**WhatsApp not connecting after upgrade:** WhatsApp is now a separate skill, not bundled in core. Run `/add-whatsapp` (or `npx tsx scripts/apply-skill.ts .claude/skills/add-whatsapp && npm run build`) to install it. Existing auth credentials and groups are preserved.
-
-## Container Build Cache
-
-The container buildkit caches the build context aggressively. `--no-cache` alone does NOT invalidate COPY steps — the builder's volume retains stale files. To force a truly clean rebuild, prune the builder then re-run `./container/build.sh`.
+If setup selected a different Linux service mode, follow the generated setup output instead of assuming the user-service path above.
