@@ -7,7 +7,9 @@ import { describe, expect, it, vi } from 'vitest';
 describe('database migrations', () => {
   it('defaults Telegram backfill chats to direct messages', async () => {
     const repoRoot = process.cwd();
-    const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'retn0claw-db-test-'));
+    const tempDir = fs.mkdtempSync(
+      path.join(os.tmpdir(), 'retn0claw-db-test-'),
+    );
 
     try {
       process.chdir(tempDir);
