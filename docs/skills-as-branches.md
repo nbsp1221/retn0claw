@@ -2,6 +2,8 @@
 
 ## Overview
 
+> Historical upstream design note: this document was inherited from NanoClaw and describes the upstream skills/marketplace model. Keep it as reference material, not as the canonical description of the current `retn0claw` fork.
+
 This document covers **feature skills** — skills that add capabilities via git branch merges. This is the most complex skill type and the primary way NanoClaw is extended.
 
 NanoClaw has four types of skills overall. See [CONTRIBUTING.md](../CONTRIBUTING.md) for the full taxonomy:

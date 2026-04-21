@@ -1,11 +1,13 @@
 # Contributing
 
+This fork is `retn0claw`, a personal derivative of NanoClaw. Parts of the contribution model below are inherited from upstream NanoClaw because the codebase and skill system still come from that lineage.
+
 ## Before You Start
 
 1. **Check for existing work.** Search open PRs and issues before starting:
    ```bash
-   gh pr list --repo qwibitai/nanoclaw --search "<your feature>"
-   gh issue list --repo qwibitai/nanoclaw --search "<your feature>"
+   gh pr list --repo nbsp1221/retn0claw --search "<your feature>"
+   gh issue list --repo nbsp1221/retn0claw --search "<your feature>"
    ```
    If a related PR or issue exists, build on it rather than duplicating effort.
 
@@ -21,7 +23,7 @@
 
 ## Skills
 
-NanoClaw uses [Claude Code skills](https://code.claude.com/docs/en/skills) — markdown files with optional supporting files that teach Claude how to do something. There are four types of skills in NanoClaw, each serving a different purpose.
+retn0claw uses [Claude Code skills](https://code.claude.com/docs/en/skills) — markdown files with optional supporting files that teach Claude how to do something. The four skill types below are inherited from NanoClaw's contribution model.
 
 ### Why skills?
 
@@ -31,7 +33,7 @@ Every user should have clean and minimal code that does exactly what they need. 
 
 #### 1. Feature skills (branch-based)
 
-Add capabilities to NanoClaw by merging a git branch. The SKILL.md contains setup instructions; the actual code lives on a `skill/*` branch.
+Add capabilities to retn0claw by merging a git branch. The SKILL.md contains setup instructions; the actual code lives on a `skill/*` branch.
 
 **Location:** `.claude/skills/` on `main` (instructions only), code on `skill/*` branch
 
@@ -43,12 +45,12 @@ Add capabilities to NanoClaw by merging a git branch. The SKILL.md contains setu
 3. Claude walks through interactive setup (env vars, bot creation, etc.)
 
 **Contributing a feature skill:**
-1. Fork `qwibitai/nanoclaw` and branch from `main`
+1. Fork `nbsp1221/retn0claw` and branch from `main`
 2. Make the code changes (new files, modified source, updated `package.json`, etc.)
 3. Add a SKILL.md in `.claude/skills/<name>/` with setup instructions — step 1 should be merging the branch
 4. Open a PR. We'll create the `skill/<name>` branch from your work
 
-See `/add-telegram` for a good example. See [docs/skills-as-branches.md](docs/skills-as-branches.md) for the full system design.
+See `/add-telegram` for a good example. [docs/skills-as-branches.md](docs/skills-as-branches.md) is retained as an upstream design reference, not as the authoritative current fork workflow.
 
 #### 2. Utility skills (with code files)
 
@@ -71,7 +73,7 @@ Workflows and guides with no code changes. The SKILL.md is the entire skill — 
 
 **Location:** `.claude/skills/` on `main`
 
-**Examples:** `/setup`, `/debug`, `/customize`, `/update-nanoclaw`, `/update-skills`
+**Examples:** `/setup`, `/debug`, `/customize`, `/update-skills`
 
 **Guidelines:**
 - Pure instructions — no code files, no branch merges

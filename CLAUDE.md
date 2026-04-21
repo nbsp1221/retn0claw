@@ -1,6 +1,6 @@
-# NanoClaw
+# retn0claw
 
-Personal Claude assistant. See [README.md](README.md) for philosophy and setup. See [docs/REQUIREMENTS.md](docs/REQUIREMENTS.md) for architecture decisions.
+Personal fork of NanoClaw under active rebranding and architectural reshaping. See [README.md](README.md) for the current framing of the fork.
 
 ## Quick Context
 
@@ -27,7 +27,7 @@ API keys, secret keys, OAuth tokens, and auth credentials are managed by the One
 
 ## Skills
 
-Four types of skills exist in NanoClaw. See [CONTRIBUTING.md](CONTRIBUTING.md) for the full taxonomy and guidelines.
+The repo still uses the same four-skill taxonomy inherited from NanoClaw. See [CONTRIBUTING.md](CONTRIBUTING.md) for the current fork's expectations and the inherited skill model.
 
 - **Feature skills** — merge a `skill/*` branch to add capabilities (e.g. `/add-telegram`, `/add-slack`)
 - **Utility skills** — ship code files alongside SKILL.md (e.g. `/claw`)
@@ -39,7 +39,7 @@ Four types of skills exist in NanoClaw. See [CONTRIBUTING.md](CONTRIBUTING.md) f
 | `/setup` | First-time installation, authentication, service configuration |
 | `/customize` | Adding channels, integrations, changing behavior |
 | `/debug` | Container issues, logs, troubleshooting |
-| `/update-nanoclaw` | Bring upstream NanoClaw updates into a customized install |
+| Upstream sync | Bring selected upstream NanoClaw changes into this fork manually |
 | `/init-onecli` | Install OneCLI Agent Vault and migrate `.env` credentials to it |
 | `/qodo-pr-resolver` | Fetch and fix Qodo PR review issues interactively or in batch |
 | `/get-qodo-rules` | Load org- and repo-level coding rules from Qodo before code tasks |
@@ -61,14 +61,14 @@ npm run build        # Compile TypeScript
 Service management:
 ```bash
 # macOS (launchd)
-launchctl load ~/Library/LaunchAgents/com.nanoclaw.plist
-launchctl unload ~/Library/LaunchAgents/com.nanoclaw.plist
-launchctl kickstart -k gui/$(id -u)/com.nanoclaw  # restart
+launchctl load ~/Library/LaunchAgents/com.retn0claw.plist
+launchctl unload ~/Library/LaunchAgents/com.retn0claw.plist
+launchctl kickstart -k gui/$(id -u)/com.retn0claw  # restart
 
 # Linux (systemd)
-systemctl --user start nanoclaw
-systemctl --user stop nanoclaw
-systemctl --user restart nanoclaw
+systemctl --user start retn0claw
+systemctl --user stop retn0claw
+systemctl --user restart retn0claw
 ```
 
 ## Troubleshooting

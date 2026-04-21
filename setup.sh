@@ -1,7 +1,7 @@
 #!/bin/bash
 set -euo pipefail
 
-# setup.sh — Bootstrap script for NanoClaw
+# setup.sh — Bootstrap script for retn0claw
 # Handles Node.js/npm setup, then hands off to the Node.js setup modules.
 # This is the only bash script in the setup flow.
 
@@ -143,7 +143,7 @@ curl -sS --max-time 3 -X POST https://us.i.posthog.com/capture/ \
   >/dev/null 2>&1 &
 
 cat <<EOF
-=== NANOCLAW SETUP: BOOTSTRAP ===
+=== RETN0CLAW SETUP: BOOTSTRAP ===
 PLATFORM: $PLATFORM
 IS_WSL: $IS_WSL
 IS_ROOT: $IS_ROOT

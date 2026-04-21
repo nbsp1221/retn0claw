@@ -1,5 +1,5 @@
 /**
- * NanoClaw Agent Runner
+ * retn0claw Agent Runner
  * Runs inside a container, receives config via stdin, outputs result to stdout
  *
  * Input protocol:
@@ -114,8 +114,8 @@ async function readStdin(): Promise<string> {
   });
 }
 
-const OUTPUT_START_MARKER = '---NANOCLAW_OUTPUT_START---';
-const OUTPUT_END_MARKER = '---NANOCLAW_OUTPUT_END---';
+const OUTPUT_START_MARKER = '---RETN0CLAW_OUTPUT_START---';
+const OUTPUT_END_MARKER = '---RETN0CLAW_OUTPUT_END---';
 
 function writeOutput(output: ContainerOutput): void {
   console.log(OUTPUT_START_MARKER);
@@ -468,20 +468,20 @@ async function runQuery(
         'ToolSearch',
         'Skill',
         'NotebookEdit',
-        'mcp__nanoclaw__*',
+        'mcp__retn0claw__*',
       ],
       env: sdkEnv,
       permissionMode: 'bypassPermissions',
       allowDangerouslySkipPermissions: true,
       settingSources: ['project', 'user'],
       mcpServers: {
-        nanoclaw: {
+        retn0claw: {
           command: 'node',
           args: [mcpServerPath],
           env: {
-            NANOCLAW_CHAT_JID: containerInput.chatJid,
-            NANOCLAW_GROUP_FOLDER: containerInput.groupFolder,
-            NANOCLAW_IS_MAIN: containerInput.isMain ? '1' : '0',
+            RETN0CLAW_CHAT_JID: containerInput.chatJid,
+            RETN0CLAW_GROUP_FOLDER: containerInput.groupFolder,
+            RETN0CLAW_IS_MAIN: containerInput.isMain ? '1' : '0',
           },
         },
       },
