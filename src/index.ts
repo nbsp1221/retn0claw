@@ -216,7 +216,9 @@ export function _setRegisteredGroups(
 }
 
 /** @internal - exported for testing */
-export function _setSessionsForTests(nextSessions: Record<string, string>): void {
+export function _setSessionsForTests(
+  nextSessions: Record<string, string>,
+): void {
   sessions = { ...nextSessions };
 }
 

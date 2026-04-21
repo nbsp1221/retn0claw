@@ -1,8 +1,6 @@
 import type { ChildProcess } from 'child_process';
 
-import {
-  runContainerAgent,
-} from './container-runner.js';
+import { runContainerAgent } from './container-runner.js';
 import { logger } from './logger.js';
 import {
   type AvailableGroup,
@@ -68,14 +66,20 @@ export interface Runner {
 function isStaleSessionError(error: string | undefined): boolean {
   return Boolean(
     error &&
-      /no conversation found|ENOENT.*\.jsonl|session.*not found/i.test(error),
+    /no conversation found|ENOENT.*\.jsonl|session.*not found/i.test(error),
   );
 }
 
 class ClaudeContainerRunner implements Runner {
   async run(args: RunDefaultRunnerArgs): Promise<RunnerOutput> {
-    const { group, session, tasksSnapshot, groupsSnapshot, onProcess, onOutput } =
-      args;
+    const {
+      group,
+      session,
+      tasksSnapshot,
+      groupsSnapshot,
+      onProcess,
+      onOutput,
+    } = args;
     const input: RunnerInput = {
       ...args.input,
       sessionId: args.input.sessionId ?? session.get(),
@@ -115,9 +119,17 @@ class ClaudeContainerRunner implements Runner {
       session.set(result.newSessionId);
     }
 
-    if (input.sessionId && result.status === 'error' && isStaleSessionError(result.error)) {
+    if (
+      input.sessionId &&
+      result.status === 'error' &&
+      isStaleSessionError(result.error)
+    ) {
       logger.warn(
-        { group: group.name, staleSessionId: input.sessionId, error: result.error },
+        {
+          group: group.name,
+          staleSessionId: input.sessionId,
+          error: result.error,
+        },
         'Stale runner session detected — clearing for next retry',
       );
       session.clear();
