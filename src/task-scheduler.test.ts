@@ -1,11 +1,16 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
+vi.mock('./runner.js', () => ({
+  runDefaultRunner: vi.fn(),
+}));
+
 import { _initTestDatabase, createTask, getTaskById } from './db.js';
 import {
   _resetSchedulerLoopForTests,
   computeNextRun,
   startSchedulerLoop,
 } from './task-scheduler.js';
+import { runDefaultRunner } from './runner.js';
 
 describe('task scheduler', () => {
   beforeEach(() => {
@@ -125,5 +130,89 @@ describe('task scheduler', () => {
     const offset =
       (new Date(nextRun!).getTime() - new Date(scheduledTime).getTime()) % ms;
     expect(offset).toBe(0);
+  });
+
+  it('routes scheduled execution through the host runner seam', async () => {
+    vi.mocked(runDefaultRunner).mockImplementation(async (args) => {
+      await args.onOutput?.({
+        status: 'success',
+        result: 'streamed',
+        newSessionId: 'session-123',
+      });
+      await args.onOutput?.({
+        status: 'success',
+        result: null,
+        newSessionId: 'session-123',
+      });
+      await new Promise((resolve) => setTimeout(resolve, 20_000));
+      return {
+        status: 'success',
+        result: 'done',
+        newSessionId: 'session-123',
+      };
+    });
+
+    createTask({
+      id: 'task-runner-seam',
+      group_folder: 'test-group',
+      chat_jid: 'test@g.us',
+      prompt: 'run',
+      schedule_type: 'once',
+      schedule_value: '2026-02-22T00:00:00.000Z',
+      context_mode: 'group',
+      next_run: new Date(Date.now() - 60_000).toISOString(),
+      status: 'active',
+      created_at: '2026-02-22T00:00:00.000Z',
+    });
+
+    const enqueueTask = vi.fn(
+      (_groupJid: string, _taskId: string, fn: () => Promise<void>) => {
+        void fn();
+      },
+    );
+
+    const notifyIdle = vi.fn();
+    const closeStdin = vi.fn();
+    const sendMessage = vi.fn(async () => {});
+
+    startSchedulerLoop({
+      registeredGroups: () => ({
+        'test@g.us': {
+          name: 'Test Group',
+          folder: 'test-group',
+          trigger: '@Andy',
+          added_at: new Date().toISOString(),
+        },
+      }),
+      getSessions: () => ({ 'test-group': 'session-existing' }),
+      queue: {
+        enqueueTask,
+        notifyIdle,
+        closeStdin,
+      } as any,
+      onProcess: () => {},
+      sendMessage,
+    });
+
+    await vi.advanceTimersByTimeAsync(10);
+
+    expect(runDefaultRunner).toHaveBeenCalledWith(
+      expect.objectContaining({
+        input: expect.objectContaining({
+          sessionId: 'session-existing',
+          prompt: 'run',
+          groupFolder: 'test-group',
+          chatJid: 'test@g.us',
+        }),
+      }),
+    );
+    expect(sendMessage).toHaveBeenCalledWith('test@g.us', 'streamed');
+    expect(notifyIdle).toHaveBeenCalled();
+
+    await vi.advanceTimersByTimeAsync(10_000);
+
+    expect(closeStdin).toHaveBeenCalledWith('test@g.us');
+
+    await vi.advanceTimersByTimeAsync(10_000);
   });
 });

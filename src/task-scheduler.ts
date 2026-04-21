@@ -4,11 +4,6 @@ import fs from 'fs';
 
 import { ASSISTANT_NAME, SCHEDULER_POLL_INTERVAL, TIMEZONE } from './config.js';
 import {
-  ContainerOutput,
-  runContainerAgent,
-  writeTasksSnapshot,
-} from './container-runner.js';
-import {
   getAllTasks,
   getDueTasks,
   getTaskById,
@@ -19,6 +14,7 @@ import {
 import { GroupQueue } from './group-queue.js';
 import { resolveGroupFolderPath } from './group-folder.js';
 import { logger } from './logger.js';
+import { runDefaultRunner } from './runner.js';
 import { RegisteredGroup, ScheduledTask } from './types.js';
 
 /**
@@ -129,31 +125,25 @@ async function runTask(
     return;
   }
 
-  // Update tasks snapshot for container to read (filtered by group)
   const isMain = group.isMain === true;
   const tasks = getAllTasks();
-  writeTasksSnapshot(
-    task.group_folder,
-    isMain,
-    tasks.map((t) => ({
-      id: t.id,
-      groupFolder: t.group_folder,
-      prompt: t.prompt,
-      script: t.script,
-      schedule_type: t.schedule_type,
-      schedule_value: t.schedule_value,
-      status: t.status,
-      next_run: t.next_run,
-    })),
-  );
 
   let result: string | null = null;
   let error: string | null = null;
 
   // For group context mode, use the group's current session
   const sessions = deps.getSessions();
-  const sessionId =
-    task.context_mode === 'group' ? sessions[task.group_folder] : undefined;
+  const sessionStore = {
+    get: () =>
+      task.context_mode === 'group' ? sessions[task.group_folder] : undefined,
+    set: (_sessionId: string) => {
+      // Task runs are single-turn today; session persistence remains a caller
+      // concern for the interactive message path.
+    },
+    clear: () => {
+      // No-op for scheduled tasks in Phase 1.
+    },
+  };
 
   // After the task produces a result, close the container promptly.
   // Tasks are single-turn — no need to wait IDLE_TIMEOUT (30 min) for the
@@ -170,11 +160,11 @@ async function runTask(
   };
 
   try {
-    const output = await runContainerAgent(
+    const output = await runDefaultRunner({
       group,
-      {
+      input: {
         prompt: task.prompt,
-        sessionId,
+        sessionId: sessionStore.get(),
         groupFolder: task.group_folder,
         chatJid: task.chat_jid,
         isMain,
@@ -182,9 +172,20 @@ async function runTask(
         assistantName: ASSISTANT_NAME,
         script: task.script || undefined,
       },
-      (proc, containerName) =>
-        deps.onProcess(task.chat_jid, proc, containerName, task.group_folder),
-      async (streamedOutput: ContainerOutput) => {
+      session: sessionStore,
+      tasksSnapshot: tasks.map((t) => ({
+        id: t.id,
+        groupFolder: t.group_folder,
+        prompt: t.prompt,
+        script: t.script,
+        schedule_type: t.schedule_type,
+        schedule_value: t.schedule_value,
+        status: t.status,
+        next_run: t.next_run,
+      })),
+      onProcess: (proc, runtimeHandle) =>
+        deps.onProcess(task.chat_jid, proc, runtimeHandle, task.group_folder),
+      onOutput: async (streamedOutput) => {
         if (streamedOutput.result) {
           result = streamedOutput.result;
           // Forward result to user (sendMessage handles formatting)
@@ -199,7 +200,7 @@ async function runTask(
           error = streamedOutput.error || 'Unknown error';
         }
       },
-    );
+    });
 
     if (closeTimer) clearTimeout(closeTimer);
 
