@@ -31,10 +31,13 @@ function createDbFixture() {
 describe('finalize runner sessions cutover', () => {
   it('refuses cutover when legacy claude sessions are not fully backfilled', async () => {
     const { db, dbPath } = createDbFixture();
-    db.prepare('INSERT INTO router_state (key, value) VALUES (?, ?)')
-      .run('runner_sessions_runtime_ready', 'phase2');
-    db.prepare('INSERT INTO sessions (group_folder, session_id) VALUES (?, ?)')
-      .run('group-a', 'session-a');
+    db.prepare('INSERT INTO router_state (key, value) VALUES (?, ?)').run(
+      'runner_sessions_runtime_ready',
+      'phase2',
+    );
+    db.prepare(
+      'INSERT INTO sessions (group_folder, session_id) VALUES (?, ?)',
+    ).run('group-a', 'session-a');
 
     const mod = await import('./finalize-runner-sessions-cutover.js');
 
@@ -52,10 +55,13 @@ describe('finalize runner sessions cutover', () => {
 
   it('writes the cutover marker after backfill is complete', async () => {
     const { db, dbPath } = createDbFixture();
-    db.prepare('INSERT INTO router_state (key, value) VALUES (?, ?)')
-      .run('runner_sessions_runtime_ready', 'phase2');
-    db.prepare('INSERT INTO sessions (group_folder, session_id) VALUES (?, ?)')
-      .run('group-a', 'session-a');
+    db.prepare('INSERT INTO router_state (key, value) VALUES (?, ?)').run(
+      'runner_sessions_runtime_ready',
+      'phase2',
+    );
+    db.prepare(
+      'INSERT INTO sessions (group_folder, session_id) VALUES (?, ?)',
+    ).run('group-a', 'session-a');
     db.prepare(
       'INSERT INTO runner_sessions (group_folder, runner_kind, session_id) VALUES (?, ?, ?)',
     ).run('group-a', 'claude', 'session-a');
@@ -78,15 +84,20 @@ describe('finalize runner sessions cutover', () => {
 
   it('refuses cutover while IPC input queues are non-empty', async () => {
     const { db, dbPath } = createDbFixture();
-    db.prepare('INSERT INTO router_state (key, value) VALUES (?, ?)')
-      .run('runner_sessions_runtime_ready', 'phase2');
-    db.prepare('INSERT INTO sessions (group_folder, session_id) VALUES (?, ?)')
-      .run('group-a', 'session-a');
+    db.prepare('INSERT INTO router_state (key, value) VALUES (?, ?)').run(
+      'runner_sessions_runtime_ready',
+      'phase2',
+    );
+    db.prepare(
+      'INSERT INTO sessions (group_folder, session_id) VALUES (?, ?)',
+    ).run('group-a', 'session-a');
     db.prepare(
       'INSERT INTO runner_sessions (group_folder, runner_kind, session_id) VALUES (?, ?, ?)',
     ).run('group-a', 'claude', 'session-a');
 
-    const tempDataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'runner-cutover-ipc-'));
+    const tempDataDir = fs.mkdtempSync(
+      path.join(os.tmpdir(), 'runner-cutover-ipc-'),
+    );
     const inputDir = path.join(tempDataDir, 'ipc', 'group-a', 'input');
     fs.mkdirSync(inputDir, { recursive: true });
     fs.writeFileSync(path.join(inputDir, 'pending.json'), '{"type":"message"}');

@@ -42,7 +42,10 @@ function getCodexRunnerCommand(): { command: string; args: string[] } {
   if (scriptPath.endsWith('.ts')) {
     return {
       command: process.execPath,
-      args: [path.join(process.cwd(), 'node_modules', 'tsx', 'dist', 'cli.mjs'), scriptPath],
+      args: [
+        path.join(process.cwd(), 'node_modules', 'tsx', 'dist', 'cli.mjs'),
+        scriptPath,
+      ],
     };
   }
   return {

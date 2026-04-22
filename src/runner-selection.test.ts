@@ -31,8 +31,6 @@ describe('runner selection', () => {
   it('throws on invalid DEFAULT_RUNNER values', async () => {
     process.env.DEFAULT_RUNNER = 'bad-runner';
 
-    await expect(importRunnerSelection()).rejects.toThrow(
-      /DEFAULT_RUNNER/i,
-    );
+    await expect(importRunnerSelection()).rejects.toThrow(/DEFAULT_RUNNER/i);
   });
 });

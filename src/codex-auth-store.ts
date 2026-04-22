@@ -16,9 +16,7 @@ function parsePlanType(idToken: string | undefined): string | null {
     const [, payload] = idToken.split('.');
     if (!payload) return null;
     const parsed = JSON.parse(Buffer.from(payload, 'base64url').toString());
-    return (
-      parsed?.['https://api.openai.com/auth']?.chatgpt_plan_type ?? null
-    );
+    return parsed?.['https://api.openai.com/auth']?.chatgpt_plan_type ?? null;
   } catch {
     return null;
   }

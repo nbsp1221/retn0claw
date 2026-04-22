@@ -634,7 +634,9 @@ export function deleteRunnerSession(
   ).run(runnerKind, groupFolder);
 }
 
-export function getAllRunnerSessions(runnerKind: string): Record<string, string> {
+export function getAllRunnerSessions(
+  runnerKind: string,
+): Record<string, string> {
   const rows = db
     .prepare(
       'SELECT group_folder, session_id FROM runner_sessions WHERE runner_kind = ?',

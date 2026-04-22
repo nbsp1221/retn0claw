@@ -93,11 +93,8 @@ describe('database migrations', () => {
       legacyDb.close();
 
       vi.resetModules();
-      const {
-        initDatabase,
-        getRunnerSession,
-        _closeDatabase,
-      } = await import('./db.js');
+      const { initDatabase, getRunnerSession, _closeDatabase } =
+        await import('./db.js');
 
       initDatabase();
 
@@ -124,11 +121,8 @@ describe('database migrations', () => {
       );
 
       vi.resetModules();
-      const {
-        initDatabase,
-        getRunnerSession,
-        _closeDatabase,
-      } = await import('./db.js');
+      const { initDatabase, getRunnerSession, _closeDatabase } =
+        await import('./db.js');
 
       initDatabase();
 

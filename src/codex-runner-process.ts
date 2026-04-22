@@ -247,7 +247,9 @@ async function main(): Promise<void> {
         const queued = readQueuedMessages(ipcInputDir);
         if (queued.length > 0) {
           try {
-            await turn.steer(parseInputItems(queued.map((q) => q.text).join('\n')));
+            await turn.steer(
+              parseInputItems(queued.map((q) => q.text).join('\n')),
+            );
             acknowledgeQueuedMessages(queued);
           } catch (error) {
             console.error(

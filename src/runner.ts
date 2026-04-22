@@ -176,7 +176,12 @@ class CodexRunner implements Runner {
         }
       : undefined;
 
-    const result = await runCodexAgent(group, input, onProcess, wrappedOnOutput);
+    const result = await runCodexAgent(
+      group,
+      input,
+      onProcess,
+      wrappedOnOutput,
+    );
 
     if (result.newSessionId) {
       session.set(result.newSessionId);

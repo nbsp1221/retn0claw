@@ -14,7 +14,10 @@ import {
 import { GroupQueue } from './group-queue.js';
 import { resolveGroupFolderPath } from './group-folder.js';
 import { logger } from './logger.js';
-import { clearRunnerSession, setRunnerSession } from './runner-session-store.js';
+import {
+  clearRunnerSession,
+  setRunnerSession,
+} from './runner-session-store.js';
 import { getSelectedRunnerKind, runDefaultRunner } from './runner.js';
 import { RegisteredGroup, ScheduledTask } from './types.js';
 

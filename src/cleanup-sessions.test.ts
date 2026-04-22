@@ -34,7 +34,11 @@ function createRepoFixture() {
     recursive: true,
   });
 
-  const sourceScript = path.join(process.cwd(), 'scripts', 'cleanup-sessions.sh');
+  const sourceScript = path.join(
+    process.cwd(),
+    'scripts',
+    'cleanup-sessions.sh',
+  );
   const targetScript = path.join(repoDir, 'scripts', 'cleanup-sessions.sh');
   fs.copyFileSync(sourceScript, targetScript);
   fs.chmodSync(targetScript, 0o755);
@@ -64,8 +68,9 @@ describe('cleanup-sessions script', () => {
   it('protects active sessions from both stores before cutover', () => {
     const { repoDir, db, scriptPath } = createRepoFixture();
 
-    db.prepare('INSERT INTO sessions (group_folder, session_id) VALUES (?, ?)')
-      .run('test-group', 'claude-active');
+    db.prepare(
+      'INSERT INTO sessions (group_folder, session_id) VALUES (?, ?)',
+    ).run('test-group', 'claude-active');
     db.prepare(
       'INSERT INTO runner_sessions (group_folder, runner_kind, session_id) VALUES (?, ?, ?)',
     ).run('test-group', 'codex', 'codex-active');
@@ -91,13 +96,16 @@ describe('cleanup-sessions script', () => {
   it('uses runner_sessions as the sole cleanup authority after cutover', () => {
     const { repoDir, db, scriptPath } = createRepoFixture();
 
-    db.prepare('INSERT INTO sessions (group_folder, session_id) VALUES (?, ?)')
-      .run('test-group', 'legacy-claude');
+    db.prepare(
+      'INSERT INTO sessions (group_folder, session_id) VALUES (?, ?)',
+    ).run('test-group', 'legacy-claude');
     db.prepare(
       'INSERT INTO runner_sessions (group_folder, runner_kind, session_id) VALUES (?, ?, ?)',
     ).run('test-group', 'codex', 'codex-active');
-    db.prepare('INSERT INTO router_state (key, value) VALUES (?, ?)')
-      .run('runner_sessions_cleanup_cutover', 'complete');
+    db.prepare('INSERT INTO router_state (key, value) VALUES (?, ?)').run(
+      'runner_sessions_cleanup_cutover',
+      'complete',
+    );
 
     const groupDir = path.join(repoDir, 'data', 'sessions', 'test-group');
     const legacyFile = createSessionFile(groupDir, 'legacy-claude');

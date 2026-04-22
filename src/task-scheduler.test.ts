@@ -287,8 +287,6 @@ describe('task scheduler', () => {
         }),
       }),
     );
-    expect(getRunnerSession('codex', 'test-group')).toBe(
-      'codex-thread-final',
-    );
+    expect(getRunnerSession('codex', 'test-group')).toBe('codex-thread-final');
   });
 });

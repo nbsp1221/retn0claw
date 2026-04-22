@@ -108,5 +108,4 @@ export const CODEX_OAUTH_TOKEN_STORE_PATH =
   envConfig.CODEX_OAUTH_TOKEN_STORE_PATH ||
   path.join(HOME_DIR, '.codex', 'auth.json');
 export const CODEX_MODEL = process.env.CODEX_MODEL || envConfig.CODEX_MODEL;
-export const CODEX_EFFORT =
-  process.env.CODEX_EFFORT || envConfig.CODEX_EFFORT;
+export const CODEX_EFFORT = process.env.CODEX_EFFORT || envConfig.CODEX_EFFORT;

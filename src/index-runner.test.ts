@@ -13,15 +13,8 @@ vi.mock('./runner-artifacts.js', () => ({
   writeGroupsSnapshot: vi.fn(),
 }));
 
-import {
-  _initTestDatabase,
-  setSession,
-  storeChatMetadata,
-} from './db.js';
-import {
-  getRunnerSession,
-  setRunnerSession,
-} from './runner-session-store.js';
+import { _initTestDatabase, setSession, storeChatMetadata } from './db.js';
+import { getRunnerSession, setRunnerSession } from './runner-session-store.js';
 import {
   _runAgentForTests,
   _setRegisteredGroups,

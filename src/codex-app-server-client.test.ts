@@ -151,7 +151,10 @@ describe('codex app-server client', () => {
       [{ type: 'text', text: 'hello', text_elements: [] }],
       { cwd: '/tmp/project', onProgress: vi.fn() },
     );
-    harness.send({ id: 4, result: { turn: { id: 'turn-1', status: 'inProgress' } } });
+    harness.send({
+      id: 4,
+      result: { turn: { id: 'turn-1', status: 'inProgress' } },
+    });
     const turn = await startTurnPromise;
 
     harness.send({
@@ -171,7 +174,13 @@ describe('codex app-server client', () => {
       params: {
         threadId: 'thread-1',
         turnId: 'turn-1',
-        item: { type: 'agentMessage', id: 'item-1', text: 'final result', phase: null, memoryCitation: null },
+        item: {
+          type: 'agentMessage',
+          id: 'item-1',
+          text: 'final result',
+          phase: null,
+          memoryCitation: null,
+        },
       },
     });
     harness.send({
@@ -269,14 +278,23 @@ describe('codex app-server client', () => {
       [{ type: 'text', text: 'second', text_elements: [] }],
       { cwd: '/tmp/project' },
     );
-    harness.send({ id: 5, result: { turn: { id: 'turn-2', status: 'inProgress' } } });
+    harness.send({
+      id: 5,
+      result: { turn: { id: 'turn-2', status: 'inProgress' } },
+    });
     const secondTurn = await secondTurnPromise;
     harness.send({
       method: 'item/completed',
       params: {
         threadId: 'thread-1',
         turnId: 'turn-2',
-        item: { type: 'agentMessage', id: 'item-2', text: 'OK', phase: null, memoryCitation: null },
+        item: {
+          type: 'agentMessage',
+          id: 'item-2',
+          text: 'OK',
+          phase: null,
+          memoryCitation: null,
+        },
       },
     });
     harness.send({
