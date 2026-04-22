@@ -1,4 +1,5 @@
 import { describe, it, expect, beforeEach, vi, afterEach } from 'vitest';
+import { EventEmitter } from 'events';
 
 import { GroupQueue } from './group-queue.js';
 
@@ -180,6 +181,39 @@ describe('GroupQueue', () => {
     expect(processMessages).not.toHaveBeenCalled();
   });
 
+  it('gracefully closes active codex runners on shutdown and escalates after the grace period', async () => {
+    const fs = await import('fs');
+    const killSpy = vi.spyOn(process, 'kill').mockImplementation(() => true);
+    const proc = Object.assign(new EventEmitter(), {
+      pid: 43210,
+      killed: false,
+      kill: vi.fn(),
+    }) as any;
+
+    queue.registerProcess(
+      'group1@g.us',
+      proc,
+      'retn0claw-codex-group1-123',
+      'test-group',
+    );
+
+    const shutdownPromise = queue.shutdown(1000);
+
+    const writeFileSync = vi.mocked(fs.default.writeFileSync);
+    expect(
+      writeFileSync.mock.calls.some(
+        (call) => typeof call[0] === 'string' && call[0].endsWith('_close'),
+      ),
+    ).toBe(true);
+
+    await vi.advanceTimersByTimeAsync(2000);
+    await shutdownPromise;
+
+    const expectedPid = process.platform === 'win32' ? 43210 : -43210;
+    expect(killSpy).toHaveBeenCalledWith(expectedPid, 'SIGTERM');
+    expect(killSpy).toHaveBeenCalledWith(expectedPid, 'SIGKILL');
+  });
+
   // --- Max retries exceeded ---
 
   it('stops retrying after MAX_RETRIES and resets', async () => {
@@ -306,11 +340,12 @@ describe('GroupQueue', () => {
     );
 
     // Enqueue a task while container is active but NOT idle
+    const writeFileSync = vi.mocked(fs.default.writeFileSync);
+    writeFileSync.mockClear();
     const taskFn = vi.fn(async () => {});
     queue.enqueueTask('group1@g.us', 'task-1', taskFn);
 
     // _close should NOT have been written (container is working, not idle)
-    const writeFileSync = vi.mocked(fs.default.writeFileSync);
     const closeWrites = writeFileSync.mock.calls.filter(
       (call) => typeof call[0] === 'string' && call[0].endsWith('_close'),
     );

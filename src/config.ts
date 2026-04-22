@@ -8,6 +8,10 @@ import { isValidTimezone } from './timezone.js';
 const envConfig = readEnvFile([
   'ASSISTANT_NAME',
   'ASSISTANT_HAS_OWN_NUMBER',
+  'CODEX_EFFORT',
+  'CODEX_MODEL',
+  'CODEX_OAUTH_TOKEN_STORE_PATH',
+  'DEFAULT_RUNNER',
   'ONECLI_URL',
   'ONECLI_API_KEY',
   'TZ',
@@ -97,3 +101,12 @@ function resolveConfigTimezone(): string {
   return 'UTC';
 }
 export const TIMEZONE = resolveConfigTimezone();
+export const DEFAULT_RUNNER =
+  process.env.DEFAULT_RUNNER || envConfig.DEFAULT_RUNNER || 'claude';
+export const CODEX_OAUTH_TOKEN_STORE_PATH =
+  process.env.CODEX_OAUTH_TOKEN_STORE_PATH ||
+  envConfig.CODEX_OAUTH_TOKEN_STORE_PATH ||
+  path.join(HOME_DIR, '.codex', 'auth.json');
+export const CODEX_MODEL = process.env.CODEX_MODEL || envConfig.CODEX_MODEL;
+export const CODEX_EFFORT =
+  process.env.CODEX_EFFORT || envConfig.CODEX_EFFORT;

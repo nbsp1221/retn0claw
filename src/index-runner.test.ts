@@ -4,6 +4,10 @@ vi.mock('./container-runner.js', () => ({
   runContainerAgent: vi.fn(),
 }));
 
+vi.mock('./codex-runner.js', () => ({
+  runCodexAgent: vi.fn(),
+}));
+
 vi.mock('./runner-artifacts.js', () => ({
   writeTasksSnapshot: vi.fn(),
   writeGroupsSnapshot: vi.fn(),
@@ -11,16 +15,20 @@ vi.mock('./runner-artifacts.js', () => ({
 
 import {
   _initTestDatabase,
-  getAllSessions,
   setSession,
   storeChatMetadata,
 } from './db.js';
+import {
+  getRunnerSession,
+  setRunnerSession,
+} from './runner-session-store.js';
 import {
   _runAgentForTests,
   _setRegisteredGroups,
   _setSessionsForTests,
 } from './index.js';
 import { runContainerAgent } from './container-runner.js';
+import { runCodexAgent } from './codex-runner.js';
 
 const testGroup = {
   name: 'Test Group',
@@ -92,7 +100,7 @@ describe('interactive runner seam', () => {
         newSessionId: 'session-stream',
       }),
     );
-    expect(getAllSessions()['test-group']).toBe('session-final');
+    expect(getRunnerSession('claude', 'test-group')).toBe('session-final');
     expect(result).toBe('success');
   });
 
@@ -116,7 +124,58 @@ describe('interactive runner seam', () => {
       expect.any(Function),
       undefined,
     );
-    expect(getAllSessions()['test-group']).toBeUndefined();
+    expect(getRunnerSession('claude', 'test-group')).toBeUndefined();
     expect(result).toBe('error');
+  });
+
+  it('loads and persists codex sessions when DEFAULT_RUNNER=codex', async () => {
+    process.env.DEFAULT_RUNNER = 'codex';
+    vi.resetModules();
+
+    const db = await import('./db.js');
+    const runnerSessionStore = await import('./runner-session-store.js');
+    const indexMod = await import('./index.js');
+    const codexRunner = await import('./codex-runner.js');
+
+    db._initTestDatabase();
+    indexMod._setRegisteredGroups({ 'test@g.us': testGroup });
+    indexMod._setSessionsForTests({ 'test-group': 'codex-thread-existing' });
+    db.storeChatMetadata(
+      'test@g.us',
+      '2026-04-21T00:00:00.000Z',
+      'Test Group',
+      'whatsapp',
+      true,
+    );
+    runnerSessionStore.setRunnerSession(
+      'codex',
+      'test-group',
+      'codex-thread-existing',
+    );
+
+    vi.mocked(codexRunner.runCodexAgent).mockResolvedValue({
+      status: 'success',
+      result: 'codex-final',
+      newSessionId: 'codex-thread-final',
+    });
+
+    const result = await indexMod._runAgentForTests(
+      testGroup,
+      'hello',
+      'test@g.us',
+    );
+
+    expect(codexRunner.runCodexAgent).toHaveBeenCalledWith(
+      expect.objectContaining({ folder: 'test-group' }),
+      expect.objectContaining({
+        sessionId: 'codex-thread-existing',
+      }),
+      expect.any(Function),
+      undefined,
+    );
+    expect(runnerSessionStore.getRunnerSession('codex', 'test-group')).toBe(
+      'codex-thread-final',
+    );
+    expect(result).toBe('success');
   });
 });

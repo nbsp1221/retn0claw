@@ -14,7 +14,8 @@ import {
 import { GroupQueue } from './group-queue.js';
 import { resolveGroupFolderPath } from './group-folder.js';
 import { logger } from './logger.js';
-import { runDefaultRunner } from './runner.js';
+import { clearRunnerSession, setRunnerSession } from './runner-session-store.js';
+import { getSelectedRunnerKind, runDefaultRunner } from './runner.js';
 import { RegisteredGroup, ScheduledTask } from './types.js';
 
 /**
@@ -133,15 +134,19 @@ async function runTask(
 
   // For group context mode, use the group's current session
   const sessions = deps.getSessions();
+  const runnerKind = getSelectedRunnerKind();
   const sessionStore = {
     get: () =>
       task.context_mode === 'group' ? sessions[task.group_folder] : undefined,
-    set: (_sessionId: string) => {
-      // Task runs are single-turn today; session persistence remains a caller
-      // concern for the interactive message path.
+    set: (sessionId: string) => {
+      if (task.context_mode !== 'group') return;
+      sessions[task.group_folder] = sessionId;
+      setRunnerSession(runnerKind, task.group_folder, sessionId);
     },
     clear: () => {
-      // No-op for scheduled tasks in Phase 1.
+      if (task.context_mode !== 'group') return;
+      delete sessions[task.group_folder];
+      clearRunnerSession(runnerKind, task.group_folder);
     },
   };
 

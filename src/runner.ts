@@ -1,6 +1,8 @@
 import type { ChildProcess } from 'child_process';
 
+import { DEFAULT_RUNNER } from './config.js';
 import { runContainerAgent } from './container-runner.js';
+import { runCodexAgent } from './codex-runner.js';
 import { logger } from './logger.js';
 import {
   type AvailableGroup,
@@ -49,6 +51,8 @@ export interface RunnerOutput {
   error?: string;
 }
 
+export type RunnerKind = 'claude' | 'codex';
+
 export interface RunDefaultRunnerArgs {
   group: RegisteredGroup;
   input: Omit<RunnerInput, 'sessionId'> & { sessionId?: string };
@@ -62,6 +66,22 @@ export interface RunDefaultRunnerArgs {
 export interface Runner {
   run(args: RunDefaultRunnerArgs): Promise<RunnerOutput>;
 }
+
+function resolveRunnerKind(rawValue: string | undefined): RunnerKind {
+  const normalized = rawValue?.trim().toLowerCase() || 'claude';
+  if (normalized === 'claude' || normalized === 'codex') {
+    return normalized;
+  }
+  throw new Error(
+    `Invalid DEFAULT_RUNNER value "${rawValue}". Expected "claude" or "codex".`,
+  );
+}
+
+export function getSelectedRunnerKind(): RunnerKind {
+  return selectedRunnerKind;
+}
+
+const selectedRunnerKind = resolveRunnerKind(DEFAULT_RUNNER);
 
 function isStaleSessionError(error: string | undefined): boolean {
   return Boolean(
@@ -139,7 +159,56 @@ class ClaudeContainerRunner implements Runner {
   }
 }
 
-const defaultRunner: Runner = new ClaudeContainerRunner();
+class CodexRunner implements Runner {
+  async run(args: RunDefaultRunnerArgs): Promise<RunnerOutput> {
+    const { group, session, onProcess, onOutput } = args;
+    const input: RunnerInput = {
+      ...args.input,
+      sessionId: args.input.sessionId ?? session.get(),
+    };
+
+    const wrappedOnOutput = onOutput
+      ? async (output: RunnerOutput) => {
+          if (output.newSessionId) {
+            session.set(output.newSessionId);
+          }
+          await onOutput(output);
+        }
+      : undefined;
+
+    const result = await runCodexAgent(group, input, onProcess, wrappedOnOutput);
+
+    if (result.newSessionId) {
+      session.set(result.newSessionId);
+    }
+
+    if (
+      input.sessionId &&
+      result.status === 'error' &&
+      isStaleSessionError(result.error)
+    ) {
+      logger.warn(
+        {
+          group: group.name,
+          staleSessionId: input.sessionId,
+          error: result.error,
+        },
+        'Stale runner session detected — clearing for next retry',
+      );
+      session.clear();
+    }
+
+    return result;
+  }
+}
+
+function createDefaultRunner(): Runner {
+  return selectedRunnerKind === 'codex'
+    ? new CodexRunner()
+    : new ClaudeContainerRunner();
+}
+
+const defaultRunner: Runner = createDefaultRunner();
 
 export async function runDefaultRunner(
   args: RunDefaultRunnerArgs,

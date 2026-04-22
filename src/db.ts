@@ -73,6 +73,12 @@ function createSchema(database: Database.Database): void {
       group_folder TEXT PRIMARY KEY,
       session_id TEXT NOT NULL
     );
+    CREATE TABLE IF NOT EXISTS runner_sessions (
+      group_folder TEXT NOT NULL,
+      runner_kind TEXT NOT NULL,
+      session_id TEXT NOT NULL,
+      PRIMARY KEY (group_folder, runner_kind)
+    );
     CREATE TABLE IF NOT EXISTS registered_groups (
       jid TEXT PRIMARY KEY,
       name TEXT NOT NULL,
@@ -165,6 +171,8 @@ export function initDatabase(): void {
 
   db = new Database(dbPath);
   createSchema(db);
+  backfillRunnerSessionsFromLegacySessions();
+  setRouterState('runner_sessions_runtime_ready', 'phase2');
 
   // Migrate from JSON files if they exist
   migrateJsonState();
@@ -174,6 +182,8 @@ export function initDatabase(): void {
 export function _initTestDatabase(): void {
   db = new Database(':memory:');
   createSchema(db);
+  backfillRunnerSessionsFromLegacySessions();
+  setRouterState('runner_sessions_runtime_ready', 'phase2');
 }
 
 /** @internal - for tests only. */
@@ -592,6 +602,61 @@ export function getAllSessions(): Record<string, string> {
   return result;
 }
 
+export function getRunnerSession(
+  runnerKind: string,
+  groupFolder: string,
+): string | undefined {
+  const row = db
+    .prepare(
+      'SELECT session_id FROM runner_sessions WHERE runner_kind = ? AND group_folder = ?',
+    )
+    .get(runnerKind, groupFolder) as { session_id: string } | undefined;
+  return row?.session_id;
+}
+
+export function setRunnerSession(
+  runnerKind: string,
+  groupFolder: string,
+  sessionId: string,
+): void {
+  db.prepare(
+    `INSERT OR REPLACE INTO runner_sessions (group_folder, runner_kind, session_id)
+     VALUES (?, ?, ?)`,
+  ).run(groupFolder, runnerKind, sessionId);
+}
+
+export function deleteRunnerSession(
+  runnerKind: string,
+  groupFolder: string,
+): void {
+  db.prepare(
+    'DELETE FROM runner_sessions WHERE runner_kind = ? AND group_folder = ?',
+  ).run(runnerKind, groupFolder);
+}
+
+export function getAllRunnerSessions(runnerKind: string): Record<string, string> {
+  const rows = db
+    .prepare(
+      'SELECT group_folder, session_id FROM runner_sessions WHERE runner_kind = ?',
+    )
+    .all(runnerKind) as Array<{ group_folder: string; session_id: string }>;
+  const result: Record<string, string> = {};
+  for (const row of rows) {
+    result[row.group_folder] = row.session_id;
+  }
+  return result;
+}
+
+export function backfillRunnerSessionsFromLegacySessions(): number {
+  const result = db
+    .prepare(
+      `INSERT OR IGNORE INTO runner_sessions (group_folder, runner_kind, session_id)
+       SELECT group_folder, 'claude', session_id FROM sessions`,
+    )
+    .run();
+  return result.changes;
+}
+
 // --- Registered group accessors ---
 
 export function getRegisteredGroup(
@@ -729,6 +794,7 @@ function migrateJsonState(): void {
   if (sessions) {
     for (const [folder, sessionId] of Object.entries(sessions)) {
       setSession(folder, sessionId);
+      setRunnerSession('claude', folder, sessionId);
     }
   }
 

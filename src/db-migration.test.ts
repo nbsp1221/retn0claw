@@ -66,4 +66,77 @@ describe('database migrations', () => {
       process.chdir(repoRoot);
     }
   });
+
+  it('backfills legacy sessions rows into runner_sessions for claude', async () => {
+    const repoRoot = process.cwd();
+    const tempDir = fs.mkdtempSync(
+      path.join(os.tmpdir(), 'retn0claw-db-test-'),
+    );
+
+    try {
+      process.chdir(tempDir);
+      fs.mkdirSync(path.join(tempDir, 'store'), { recursive: true });
+
+      const dbPath = path.join(tempDir, 'store', 'messages.db');
+      const legacyDb = new Database(dbPath);
+      legacyDb.exec(`
+        CREATE TABLE sessions (
+          group_folder TEXT PRIMARY KEY,
+          session_id TEXT NOT NULL
+        );
+      `);
+      legacyDb
+        .prepare(
+          `INSERT INTO sessions (group_folder, session_id) VALUES (?, ?)`,
+        )
+        .run('legacy-group', 'legacy-session');
+      legacyDb.close();
+
+      vi.resetModules();
+      const {
+        initDatabase,
+        getRunnerSession,
+        _closeDatabase,
+      } = await import('./db.js');
+
+      initDatabase();
+
+      expect(getRunnerSession('claude', 'legacy-group')).toBe('legacy-session');
+
+      _closeDatabase();
+    } finally {
+      process.chdir(repoRoot);
+    }
+  });
+
+  it('routes legacy sessions.json bootstrap into runner_sessions for claude', async () => {
+    const repoRoot = process.cwd();
+    const tempDir = fs.mkdtempSync(
+      path.join(os.tmpdir(), 'retn0claw-db-test-'),
+    );
+
+    try {
+      process.chdir(tempDir);
+      fs.mkdirSync(path.join(tempDir, 'data'), { recursive: true });
+      fs.writeFileSync(
+        path.join(tempDir, 'data', 'sessions.json'),
+        JSON.stringify({ 'json-group': 'json-session' }),
+      );
+
+      vi.resetModules();
+      const {
+        initDatabase,
+        getRunnerSession,
+        _closeDatabase,
+      } = await import('./db.js');
+
+      initDatabase();
+
+      expect(getRunnerSession('claude', 'json-group')).toBe('json-session');
+
+      _closeDatabase();
+    } finally {
+      process.chdir(repoRoot);
+    }
+  });
 });

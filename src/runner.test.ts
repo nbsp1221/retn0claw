@@ -4,6 +4,10 @@ vi.mock('./container-runner.js', () => ({
   runContainerAgent: vi.fn(),
 }));
 
+vi.mock('./codex-runner.js', () => ({
+  runCodexAgent: vi.fn(),
+}));
+
 vi.mock('./runner-artifacts.js', () => ({
   writeTasksSnapshot: vi.fn(),
   writeGroupsSnapshot: vi.fn(),
@@ -22,6 +26,7 @@ describe('runner dispatch seam', () => {
   beforeEach(() => {
     vi.resetModules();
     vi.clearAllMocks();
+    delete process.env.DEFAULT_RUNNER;
   });
 
   it('prepares snapshots and persists streamed/final session ids through the host runner contract', async () => {
@@ -173,6 +178,60 @@ describe('runner dispatch seam', () => {
     expect(result).toEqual(
       expect.objectContaining({
         status: 'error',
+      }),
+    );
+  });
+
+  it('dispatches to the codex runner when DEFAULT_RUNNER=codex', async () => {
+    process.env.DEFAULT_RUNNER = 'codex';
+
+    const codexRunner = await import('./codex-runner.js');
+    vi.mocked(codexRunner.runCodexAgent).mockResolvedValue({
+      status: 'success',
+      result: 'codex-final',
+      newSessionId: 'codex-thread',
+    });
+
+    const mod = await import('./runner.js');
+
+    const session = {
+      get: vi.fn(() => 'codex-thread-old'),
+      set: vi.fn(),
+      clear: vi.fn(),
+    };
+
+    const result = await mod.runDefaultRunner({
+      group: {
+        name: 'Codex Group',
+        folder: 'codex-group',
+        trigger: '@Andy',
+        added_at: new Date().toISOString(),
+      },
+      input: {
+        prompt: 'hello codex',
+        groupFolder: 'codex-group',
+        chatJid: 'codex@g.us',
+        isMain: false,
+        assistantName: 'Andy',
+      },
+      session,
+      onProcess: vi.fn(),
+    });
+
+    expect(codexRunner.runCodexAgent).toHaveBeenCalledWith(
+      expect.objectContaining({ folder: 'codex-group' }),
+      expect.objectContaining({
+        prompt: 'hello codex',
+        sessionId: 'codex-thread-old',
+      }),
+      expect.any(Function),
+      undefined,
+    );
+    expect(session.set).toHaveBeenCalledWith('codex-thread');
+    expect(result).toEqual(
+      expect.objectContaining({
+        status: 'success',
+        newSessionId: 'codex-thread',
       }),
     );
   });

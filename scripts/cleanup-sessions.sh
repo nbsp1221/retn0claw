@@ -16,6 +16,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
+SOURCE_ROOT="${RETN0CLAW_SOURCE_ROOT:-$PROJECT_ROOT}"
 
 STORE_DB="$PROJECT_ROOT/store/messages.db"
 SESSIONS_DIR="$PROJECT_ROOT/data/sessions"
@@ -59,7 +60,67 @@ if [ ! -f "$STORE_DB" ]; then
   exit 1
 fi
 
-ACTIVE_IDS=$(sqlite3 "$STORE_DB" "SELECT session_id FROM sessions;" 2>/dev/null || true)
+ACTIVE_IDS=$(
+  STORE_DB="$STORE_DB" RETN0CLAW_SOURCE_ROOT="$SOURCE_ROOT" node --input-type=module <<'EOF'
+import path from 'path';
+import { createRequire } from 'module';
+
+const sourceRoot = process.env.RETN0CLAW_SOURCE_ROOT;
+const require = createRequire(path.join(sourceRoot, 'package.json'));
+const Database = require('better-sqlite3');
+
+const dbPath = process.env.STORE_DB;
+const db = new Database(dbPath, { readonly: true });
+
+const tableExists = (name) => {
+  const row = db
+    .prepare(
+      "SELECT name FROM sqlite_master WHERE type = 'table' AND name = ? LIMIT 1",
+    )
+    .get(name);
+  return Boolean(row);
+};
+
+const marker =
+  db
+    .prepare(
+      "SELECT value FROM router_state WHERE key = 'runner_sessions_cleanup_cutover' LIMIT 1",
+    )
+    .get()?.value || '';
+const cutoverComplete = marker === 'complete';
+
+const rows = [];
+if (cutoverComplete) {
+  if (tableExists('runner_sessions')) {
+    rows.push(
+      ...db
+        .prepare('SELECT session_id FROM runner_sessions')
+        .all()
+        .map((row) => row.session_id),
+    );
+  }
+} else {
+  if (tableExists('sessions')) {
+    rows.push(
+      ...db
+        .prepare('SELECT session_id FROM sessions')
+        .all()
+        .map((row) => row.session_id),
+    );
+  }
+  if (tableExists('runner_sessions')) {
+    rows.push(
+      ...db
+        .prepare('SELECT session_id FROM runner_sessions')
+        .all()
+        .map((row) => row.session_id),
+    );
+  }
+}
+
+console.log([...new Set(rows)].join('\n'));
+EOF
+)
 
 is_active() {
   echo "$ACTIVE_IDS" | grep -qF "$1"

@@ -32,8 +32,6 @@ import {
 import {
   getAllChats,
   getAllRegisteredGroups,
-  getAllSessions,
-  deleteSession,
   getAllTasks,
   getLastBotMessageTimestamp,
   getMessagesSince,
@@ -42,7 +40,6 @@ import {
   initDatabase,
   setRegisteredGroup,
   setRouterState,
-  setSession,
   storeChatMetadata,
   storeMessage,
 } from './db.js';
@@ -63,9 +60,19 @@ import {
 } from './sender-allowlist.js';
 import { startSessionCleanup } from './session-cleanup.js';
 import { startSchedulerLoop } from './task-scheduler.js';
-import { runDefaultRunner, type RunnerOutput } from './runner.js';
+import {
+  getSelectedRunnerKind,
+  runDefaultRunner,
+  type RunnerOutput,
+} from './runner.js';
 import { Channel, NewMessage, RegisteredGroup } from './types.js';
 import { logger } from './logger.js';
+import { assertCodexRunnerReadiness } from './codex-auth-store.js';
+import {
+  clearRunnerSession,
+  getRunnerSessions,
+  setRunnerSession,
+} from './runner-session-store.js';
 
 // Re-export for backwards compatibility during refactor
 export { escapeXml, formatMessages } from './router.js';
@@ -109,10 +116,11 @@ function loadState(): void {
     logger.warn('Corrupted last_agent_timestamp in DB, resetting');
     lastAgentTimestamp = {};
   }
-  sessions = getAllSessions();
+  const runnerKind = getSelectedRunnerKind();
+  sessions = getRunnerSessions(runnerKind);
   registeredGroups = getAllRegisteredGroups();
   logger.info(
-    { groupCount: Object.keys(registeredGroups).length },
+    { groupCount: Object.keys(registeredGroups).length, runnerKind },
     'State loaded',
   );
 }
@@ -351,17 +359,18 @@ async function runAgent(
   onOutput?: (output: RunnerOutput) => Promise<void>,
 ): Promise<'success' | 'error'> {
   const isMain = group.isMain === true;
+  const runnerKind = getSelectedRunnerKind();
   const tasks = getAllTasks();
   const availableGroups = getAvailableGroups();
   const sessionStore = {
     get: () => sessions[group.folder],
     set: (sessionId: string) => {
       sessions[group.folder] = sessionId;
-      setSession(group.folder, sessionId);
+      setRunnerSession(runnerKind, group.folder, sessionId);
     },
     clear: () => {
       delete sessions[group.folder];
-      deleteSession(group.folder);
+      clearRunnerSession(runnerKind, group.folder);
     },
   };
 
@@ -547,6 +556,7 @@ async function main(): Promise<void> {
   ensureContainerSystemRunning();
   initDatabase();
   logger.info('Database initialized');
+  assertCodexRunnerReadiness();
   loadState();
 
   // Ensure OneCLI agents exist for all registered groups.

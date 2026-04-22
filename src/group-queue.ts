@@ -23,6 +23,7 @@ interface GroupState {
   pendingTasks: QueuedTask[];
   process: ChildProcess | null;
   containerName: string | null;
+  runtimeKind: 'container' | 'codex';
   groupFolder: string | null;
   retryCount: number;
 }
@@ -47,6 +48,7 @@ export class GroupQueue {
         pendingTasks: [],
         process: null,
         containerName: null,
+        runtimeKind: 'container',
         groupFolder: null,
         retryCount: 0,
       };
@@ -138,6 +140,9 @@ export class GroupQueue {
     const state = this.getGroup(groupJid);
     state.process = proc;
     state.containerName = containerName;
+    state.runtimeKind = containerName.startsWith('retn0claw-codex-')
+      ? 'codex'
+      : 'container';
     if (groupFolder) state.groupFolder = groupFolder;
   }
 
@@ -182,7 +187,8 @@ export class GroupQueue {
    */
   closeStdin(groupJid: string): void {
     const state = this.getGroup(groupJid);
-    if (!state.active || !state.groupFolder) return;
+    if (!state.groupFolder) return;
+    if (!state.active && !state.process) return;
 
     const inputDir = path.join(DATA_DIR, 'ipc', state.groupFolder, 'input');
     try {
@@ -346,20 +352,84 @@ export class GroupQueue {
 
   async shutdown(_gracePeriodMs: number): Promise<void> {
     this.shuttingDown = true;
+    const killRuntimeProcess = (pid: number, signal: NodeJS.Signals): void => {
+      if (process.platform === 'win32') {
+        process.kill(pid, signal);
+        return;
+      }
+      process.kill(-pid, signal);
+    };
 
-    // Count active containers but don't kill them — they'll finish on their own
-    // via idle timeout or container timeout. The --rm flag cleans them up on exit.
-    // This prevents WhatsApp reconnection restarts from killing working agents.
     const activeContainers: string[] = [];
-    for (const [_jid, state] of this.groups) {
+    const activeCodexProcesses: Array<{
+      jid: string;
+      pid: number;
+      process: ChildProcess;
+    }> = [];
+    for (const [jid, state] of this.groups) {
       if (state.process && !state.process.killed && state.containerName) {
-        activeContainers.push(state.containerName);
+        if (state.runtimeKind === 'codex' && state.process.pid) {
+          activeCodexProcesses.push({
+            jid,
+            pid: state.process.pid,
+            process: state.process,
+          });
+          if (state.groupFolder) {
+            this.closeStdin(jid);
+          }
+        } else {
+          activeContainers.push(state.containerName);
+        }
+      }
+    }
+
+    const waitForProcesses = async (
+      processes: Array<{ process: ChildProcess }>,
+      timeoutMs: number,
+    ): Promise<void> => {
+      if (processes.length === 0) return;
+      await Promise.race([
+        Promise.all(
+          processes.map(
+            ({ process }) =>
+              new Promise<void>((resolve) => {
+                process.once('close', () => resolve());
+              }),
+          ),
+        ),
+        new Promise((resolve) => setTimeout(resolve, timeoutMs)),
+      ]);
+    };
+
+    if (activeCodexProcesses.length > 0) {
+      await waitForProcesses(activeCodexProcesses, _gracePeriodMs);
+
+      const remainingAfterGrace = activeCodexProcesses.filter(
+        ({ process }) => !process.killed,
+      );
+      for (const group of remainingAfterGrace) {
+        try {
+          killRuntimeProcess(group.pid, 'SIGTERM');
+        } catch {
+          // ignore
+        }
+      }
+
+      await waitForProcesses(remainingAfterGrace, 1000);
+
+      for (const group of remainingAfterGrace) {
+        if (group.process.killed) continue;
+        try {
+          killRuntimeProcess(group.pid, 'SIGKILL');
+        } catch {
+          // ignore
+        }
       }
     }
 
     logger.info(
       { activeCount: this.activeCount, detachedContainers: activeContainers },
-      'GroupQueue shutting down (containers detached, not killed)',
+      'GroupQueue shutting down (containers detached, codex runners terminated)',
     );
   }
 }

@@ -3,10 +3,12 @@ import { EventEmitter } from 'events';
 
 vi.mock('./runner.js', () => ({
   runDefaultRunner: vi.fn(),
+  getSelectedRunnerKind: vi.fn(() => 'claude'),
 }));
 
-import { _initTestDatabase, createTask, getAllSessions } from './db.js';
+import { _initTestDatabase, createTask } from './db.js';
 import { GroupQueue } from './group-queue.js';
+import { getRunnerSession } from './runner-session-store.js';
 import {
   _runAgentForTests,
   _setRegisteredGroups,
@@ -105,7 +107,7 @@ describe('interactive runner path', () => {
         newSessionId: 'session-stream',
       }),
     );
-    expect(getAllSessions()).toEqual({ 'test-group': 'session-final' });
+    expect(getRunnerSession('claude', 'test-group')).toBe('session-final');
     expect(result).toBe('success');
   });
 });
