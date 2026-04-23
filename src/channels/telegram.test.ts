@@ -39,6 +39,9 @@ const botRef = vi.hoisted(() => ({ current: null as any }));
 const telegramStartErrorRef = vi.hoisted(() => ({
   current: null as Error | null,
 }));
+const undiciFetchRef = vi.hoisted(() => ({
+  current: vi.fn(),
+}));
 
 vi.mock('grammy', () => ({
   Bot: class MockBot {
@@ -81,6 +84,13 @@ vi.mock('grammy', () => ({
 
     stop() {}
   },
+}));
+
+vi.mock('undici', () => ({
+  Agent: class MockAgent {
+    constructor(_options: unknown) {}
+  },
+  fetch: undiciFetchRef.current,
 }));
 
 import fs from 'fs';
@@ -217,6 +227,10 @@ describe('TelegramChannel', () => {
         arrayBuffer: vi.fn().mockResolvedValue(new ArrayBuffer(8)),
       }),
     );
+    undiciFetchRef.current.mockResolvedValue({
+      ok: true,
+      arrayBuffer: vi.fn().mockResolvedValue(new ArrayBuffer(8)),
+    });
   });
 
   afterEach(() => {

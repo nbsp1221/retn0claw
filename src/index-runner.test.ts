@@ -1,27 +1,34 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
-vi.mock('./container-runner.js', () => ({
+vi.hoisted(() => {
+  process.env.DEFAULT_RUNNER = 'claude';
+});
+
+vi.mock('./runners/claude/container-runner.js', () => ({
   runContainerAgent: vi.fn(),
 }));
 
-vi.mock('./codex-runner.js', () => ({
+vi.mock('./runners/codex/codex-runner.js', () => ({
   runCodexAgent: vi.fn(),
 }));
 
-vi.mock('./runner-artifacts.js', () => ({
+vi.mock('./runners/shared/runner-artifacts.js', () => ({
   writeTasksSnapshot: vi.fn(),
   writeGroupsSnapshot: vi.fn(),
 }));
 
 import { _initTestDatabase, setSession, storeChatMetadata } from './db.js';
-import { getRunnerSession, setRunnerSession } from './runner-session-store.js';
+import {
+  getRunnerSession,
+  setRunnerSession,
+} from './runners/shared/runner-session-store.js';
 import {
   _runAgentForTests,
   _setRegisteredGroups,
   _setSessionsForTests,
 } from './index.js';
-import { runContainerAgent } from './container-runner.js';
-import { runCodexAgent } from './codex-runner.js';
+import { runContainerAgent } from './runners/claude/container-runner.js';
+import { runCodexAgent } from './runners/codex/codex-runner.js';
 
 const testGroup = {
   name: 'Test Group',
@@ -32,6 +39,7 @@ const testGroup = {
 
 describe('interactive runner seam', () => {
   beforeEach(() => {
+    process.env.DEFAULT_RUNNER = 'claude';
     _initTestDatabase();
     _setRegisteredGroups({ 'test@g.us': testGroup });
     _setSessionsForTests({});
@@ -126,9 +134,10 @@ describe('interactive runner seam', () => {
     vi.resetModules();
 
     const db = await import('./db.js');
-    const runnerSessionStore = await import('./runner-session-store.js');
+    const runnerSessionStore =
+      await import('./runners/shared/runner-session-store.js');
     const indexMod = await import('./index.js');
-    const codexRunner = await import('./codex-runner.js');
+    const codexRunner = await import('./runners/codex/codex-runner.js');
 
     db._initTestDatabase();
     indexMod._setRegisteredGroups({ 'test@g.us': testGroup });

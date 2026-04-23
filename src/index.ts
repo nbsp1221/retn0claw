@@ -1,5 +1,6 @@
 import fs from 'fs';
 import path from 'path';
+import { randomUUID } from 'crypto';
 
 import { OneCLI } from '@onecli-sh/sdk';
 
@@ -24,11 +25,11 @@ import {
   type AvailableGroup,
   writeGroupsSnapshot,
   writeTasksSnapshot,
-} from './runner-artifacts.js';
+} from './runners/shared/runner-artifacts.js';
 import {
   cleanupOrphans,
   ensureContainerRuntimeRunning,
-} from './container-runtime.js';
+} from './runners/claude/container-runtime.js';
 import {
   getAllChats,
   getAllRegisteredGroups,
@@ -62,17 +63,21 @@ import { startSessionCleanup } from './session-cleanup.js';
 import { startSchedulerLoop } from './task-scheduler.js';
 import {
   getSelectedRunnerKind,
+  isTerminalRunnerOutput,
+  type RunnerKind,
   runDefaultRunner,
   type RunnerOutput,
-} from './runner.js';
+} from './runners/shared/runner.js';
+import { createRunnerOutputAuditLoggerFactory } from './runners/shared/delivery-audit.js';
+import { createDeliveryTurnManager } from './runners/shared/delivery-turn-manager.js';
 import { Channel, NewMessage, RegisteredGroup } from './types.js';
 import { logger } from './logger.js';
-import { assertCodexRunnerReadiness } from './codex-auth-store.js';
+import { assertCodexRunnerReadiness } from './runners/codex/codex-auth-store.js';
 import {
   clearRunnerSession,
   getRunnerSessions,
   setRunnerSession,
-} from './runner-session-store.js';
+} from './runners/shared/runner-session-store.js';
 
 // Re-export for backwards compatibility during refactor
 export { escapeXml, formatMessages } from './router.js';
@@ -230,6 +235,12 @@ export function _setSessionsForTests(
   sessions = { ...nextSessions };
 }
 
+/** @internal - exported for testing */
+export function _setChannelsForTests(nextChannels: Channel[]): void {
+  channels.length = 0;
+  channels.push(...nextChannels);
+}
+
 /**
  * Process all pending messages for a group.
  * Called by the GroupQueue when it's this group's turn.
@@ -298,33 +309,65 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
   await channel.setTyping?.(chatJid, true);
   let hadError = false;
   let outputSentToUser = false;
-
-  const output = await runAgent(group, prompt, chatJid, async (result) => {
-    // Streaming output callback — called for each agent result
-    if (result.result) {
-      const raw =
-        typeof result.result === 'string'
-          ? result.result
-          : JSON.stringify(result.result);
-      // Strip <internal>...</internal> blocks — agent uses these for internal reasoning
-      const text = raw.replace(/<internal>[\s\S]*?<\/internal>/g, '').trim();
-      logger.info({ group: group.name }, `Agent output: ${raw.length} chars`);
-      if (text) {
-        await channel.sendMessage(chatJid, text);
-        outputSentToUser = true;
-      }
-      // Only reset idle timer on actual results, not session-update markers (result: null)
-      resetIdleTimer();
-    }
-
-    if (result.status === 'success') {
-      queue.notifyIdle(chatJid);
-    }
-
-    if (result.status === 'error') {
-      hadError = true;
-    }
+  const runId = randomUUID();
+  const runnerKind = getSelectedRunnerKind();
+  let latestSessionId: string | null = null;
+  const createAudit = createRunnerOutputAuditLoggerFactory(
+    {
+      groupFolder: group.folder,
+      chatJid,
+      runnerKind,
+      runId,
+    },
+    () => latestSessionId,
+  );
+  const deliveryTurnManager = createDeliveryTurnManager({
+    createAuditLogger: createAudit,
   });
+
+  const output = await runAgent(
+    group,
+    prompt,
+    chatJid,
+    async (result) => {
+      if (result.newSessionId) {
+        latestSessionId = result.newSessionId;
+      }
+      const delivery = deliveryTurnManager.consume(result);
+
+      if (delivery.sendText) {
+        const raw =
+          typeof delivery.sendText === 'string'
+            ? delivery.sendText
+            : JSON.stringify(delivery.sendText);
+        // Strip <internal>...</internal> blocks — agent uses these for internal reasoning
+        const text = raw.replace(/<internal>[\s\S]*?<\/internal>/g, '').trim();
+        logger.info({ group: group.name }, `Agent output: ${raw.length} chars`);
+        if (text) {
+          try {
+            await channel.sendMessage(chatJid, text);
+            createAudit(result).finalSent(text);
+          } catch (error) {
+            createAudit(result).finalFailed(
+              error instanceof Error ? error.message : String(error),
+            );
+            throw error;
+          }
+          outputSentToUser = true;
+        }
+        resetIdleTimer();
+      }
+
+      if (delivery.notifyIdle) {
+        queue.notifyIdle(chatJid);
+      }
+
+      if (result.status === 'error') {
+        hadError = true;
+      }
+    },
+    runId,
+  );
 
   await channel.setTyping?.(chatJid, false);
   if (idleTimer) clearTimeout(idleTimer);
@@ -357,6 +400,7 @@ async function runAgent(
   prompt: string,
   chatJid: string,
   onOutput?: (output: RunnerOutput) => Promise<void>,
+  runId = randomUUID(),
 ): Promise<'success' | 'error'> {
   const isMain = group.isMain === true;
   const runnerKind = getSelectedRunnerKind();
@@ -379,6 +423,7 @@ async function runAgent(
       group,
       input: {
         prompt,
+        runId,
         groupFolder: group.folder,
         chatJid,
         isMain,
@@ -421,6 +466,8 @@ async function runAgent(
 
 /** @internal - exported for testing */
 export { runAgent as _runAgentForTests };
+/** @internal - exported for testing */
+export { processGroupMessages as _processGroupMessagesForTests };
 
 async function startMessageLoop(): Promise<void> {
   if (messageLoopRunning) {
@@ -547,13 +594,21 @@ function recoverPendingMessages(): void {
   }
 }
 
-function ensureContainerSystemRunning(): void {
+export function shouldBootstrapClaudeRuntime(runnerKind: RunnerKind): boolean {
+  return runnerKind === 'claude';
+}
+
+function ensureContainerSystemRunning(runnerKind: RunnerKind): void {
+  if (!shouldBootstrapClaudeRuntime(runnerKind)) {
+    return;
+  }
   ensureContainerRuntimeRunning();
   cleanupOrphans();
 }
 
 async function main(): Promise<void> {
-  ensureContainerSystemRunning();
+  const runnerKind = getSelectedRunnerKind();
+  ensureContainerSystemRunning(runnerKind);
   initDatabase();
   logger.info('Database initialized');
   assertCodexRunnerReadiness();

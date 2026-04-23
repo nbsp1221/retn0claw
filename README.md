@@ -65,6 +65,25 @@ Then run `/setup`.
 
 > **Note:** Commands prefixed with `/` such as `/setup` and `/debug` are Claude Code skills. Run them inside the `claude` CLI prompt, not in your regular shell.
 
+## Testing
+
+The test suite is split by purpose:
+
+```bash
+npm run test:unit
+npm run test:contract
+npm run test:integration
+npm run test:property:pr
+npm run test:ci
+```
+
+- `test:unit`: source-local and setup tests
+- `test:contract`: implementation-agnostic semantic delivery contracts
+- `test:integration`: orchestration and channel transport behavior
+- `test:property:pr`: deterministic invariant checks with bounded runs
+- `test:property:stress`: larger manual stress sweep
+- `test:ci`: the pull-request gate
+
 ## Example Uses
 
 This repository is aimed at software-project tasks such as:
@@ -86,7 +105,9 @@ At a high level:
 
 - `src/index.ts` runs the main orchestration loop
 - `src/group-queue.ts` serializes per-group work
-- `src/container-runner.ts` launches agent containers
+- `src/runners/claude/container-runner.ts` launches Claude agent containers
+- `src/runners/codex/` contains the Codex runtime/app-server integration
+- `src/runners/shared/runner.ts` selects and dispatches the active runner
 - `src/task-scheduler.ts` runs scheduled jobs
 - `src/db.ts` stores messages, sessions, groups, and task state
 - `groups/*/CLAUDE.md` holds per-group memory and instructions

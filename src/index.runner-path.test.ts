@@ -1,20 +1,33 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest';
 import { EventEmitter } from 'events';
 
-vi.mock('./runner.js', () => ({
+vi.mock('./runners/shared/runner.js', () => ({
   runDefaultRunner: vi.fn(),
   getSelectedRunnerKind: vi.fn(() => 'claude'),
 }));
 
 import { _initTestDatabase, createTask } from './db.js';
 import { GroupQueue } from './group-queue.js';
-import { getRunnerSession } from './runner-session-store.js';
+import { getRunnerSession } from './runners/shared/runner-session-store.js';
 import {
   _runAgentForTests,
   _setRegisteredGroups,
   _setSessionsForTests,
 } from './index.js';
-import { runDefaultRunner } from './runner.js';
+import { runDefaultRunner } from './runners/shared/runner.js';
+import type { RunnerOutput } from './runners/shared/runner.js';
+
+function output(overrides: Partial<RunnerOutput>): RunnerOutput {
+  return {
+    status: 'success',
+    eventKind: 'final',
+    phase: 'final',
+    threadId: 'thread-1',
+    turnId: 'turn-1',
+    result: 'final',
+    ...overrides,
+  };
+}
 
 describe('interactive runner path', () => {
   beforeEach(() => {
@@ -54,17 +67,21 @@ describe('interactive runner path', () => {
 
     vi.mocked(runDefaultRunner).mockImplementation(async (args) => {
       args.onProcess(new EventEmitter() as any, 'runtime-handle');
-      await args.onOutput?.({
-        status: 'success',
-        result: 'streamed',
-        newSessionId: 'session-stream',
-      });
+      await args.onOutput?.(
+        output({
+          eventKind: 'progress',
+          phase: 'progress',
+          result: 'streamed',
+          newSessionId: 'session-stream',
+          threadId: 'session-stream',
+        }),
+      );
       args.session.set('session-final');
-      return {
-        status: 'success',
+      return output({
         result: 'final',
         newSessionId: 'session-final',
-      };
+        threadId: 'session-final',
+      });
     });
 
     const onOutput = vi.fn(async () => {});

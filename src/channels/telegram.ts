@@ -8,6 +8,7 @@ import { ASSISTANT_NAME, TRIGGER_PATTERN } from '../config.js';
 import { readEnvFile } from '../env.js';
 import { resolveGroupFolderPath } from '../group-folder.js';
 import { logger } from '../logger.js';
+import { createTelegramFetch } from './telegram-fetch.js';
 import { registerChannel, ChannelOpts } from './registry.js';
 import {
   Channel,
@@ -52,6 +53,7 @@ export class TelegramChannel implements Channel {
   private opts: TelegramChannelOpts;
   private botToken: string;
   private started = false;
+  private telegramFetch = createTelegramFetch();
 
   constructor(botToken: string, opts: TelegramChannelOpts) {
     this.botToken = botToken;
@@ -89,7 +91,7 @@ export class TelegramChannel implements Channel {
       const destPath = path.join(attachDir, finalName);
 
       const fileUrl = `https://api.telegram.org/file/bot${this.botToken}/${file.file_path}`;
-      const resp = await fetch(fileUrl);
+      const resp = await this.telegramFetch(fileUrl);
       if (!resp.ok) {
         logger.warn(
           { fileId, status: resp.status },
@@ -112,6 +114,7 @@ export class TelegramChannel implements Channel {
   async connect(): Promise<void> {
     this.bot = new Bot(this.botToken, {
       client: {
+        fetch: this.telegramFetch,
         baseFetchConfig: { agent: https.globalAgent, compress: true },
       },
     });

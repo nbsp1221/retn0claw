@@ -1,20 +1,42 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-vi.mock('./runner.js', () => ({
+vi.mock('./runners/shared/runner.js', () => ({
   runDefaultRunner: vi.fn(),
   getSelectedRunnerKind: vi.fn(() =>
     process.env.DEFAULT_RUNNER === 'codex' ? 'codex' : 'claude',
   ),
+  isTerminalRunnerOutput: vi.fn(
+    (output: { eventKind?: string }) =>
+      output.eventKind === 'final' ||
+      output.eventKind === 'turn_failed' ||
+      output.eventKind === 'turn_interrupted',
+  ),
 }));
 
 import { _initTestDatabase, createTask, getTaskById } from './db.js';
-import { getRunnerSession, setRunnerSession } from './runner-session-store.js';
+import {
+  getRunnerSession,
+  setRunnerSession,
+} from './runners/shared/runner-session-store.js';
 import {
   _resetSchedulerLoopForTests,
   computeNextRun,
   startSchedulerLoop,
 } from './task-scheduler.js';
-import { runDefaultRunner } from './runner.js';
+import { runDefaultRunner } from './runners/shared/runner.js';
+import type { RunnerOutput } from './runners/shared/runner.js';
+
+function output(overrides: Partial<RunnerOutput>): RunnerOutput {
+  return {
+    status: 'success',
+    eventKind: 'final',
+    phase: 'final',
+    threadId: 'thread-1',
+    turnId: 'turn-1',
+    result: 'done',
+    ...overrides,
+  };
+}
 
 describe('task scheduler', () => {
   beforeEach(() => {
@@ -139,22 +161,38 @@ describe('task scheduler', () => {
 
   it('routes scheduled execution through the host runner seam', async () => {
     vi.mocked(runDefaultRunner).mockImplementation(async (args) => {
-      await args.onOutput?.({
-        status: 'success',
-        result: 'streamed',
-        newSessionId: 'session-123',
-      });
-      await args.onOutput?.({
-        status: 'success',
-        result: null,
-        newSessionId: 'session-123',
-      });
+      await args.onOutput?.(
+        output({
+          eventKind: 'meta',
+          phase: 'meta',
+          result: null,
+          newSessionId: 'session-123',
+          threadId: 'session-123',
+          turnId: null,
+        }),
+      );
+      await args.onOutput?.(
+        output({
+          eventKind: 'progress',
+          phase: 'progress',
+          result: 'streamed',
+          newSessionId: 'session-123',
+          threadId: 'session-123',
+        }),
+      );
+      await args.onOutput?.(
+        output({
+          result: 'done',
+          newSessionId: 'session-123',
+          threadId: 'session-123',
+        }),
+      );
       await new Promise((resolve) => setTimeout(resolve, 20_000));
-      return {
-        status: 'success',
+      return output({
         result: 'done',
         newSessionId: 'session-123',
-      };
+        threadId: 'session-123',
+      });
     });
 
     createTask({
@@ -211,8 +249,9 @@ describe('task scheduler', () => {
         }),
       }),
     );
-    expect(sendMessage).toHaveBeenCalledWith('test@g.us', 'streamed');
-    expect(notifyIdle).toHaveBeenCalled();
+    expect(sendMessage).toHaveBeenCalledTimes(1);
+    expect(sendMessage).toHaveBeenCalledWith('test@g.us', 'done');
+    expect(notifyIdle).toHaveBeenCalledTimes(1);
 
     await vi.advanceTimersByTimeAsync(10_000);
 
@@ -226,16 +265,20 @@ describe('task scheduler', () => {
 
     vi.mocked(runDefaultRunner).mockImplementation(async (args) => {
       args.session.set('codex-thread-final');
-      await args.onOutput?.({
-        status: 'success',
+      await args.onOutput?.(
+        output({
+          eventKind: 'progress',
+          phase: 'progress',
+          result: 'codex-streamed',
+          newSessionId: 'codex-thread-final',
+          threadId: 'codex-thread-final',
+        }),
+      );
+      return output({
         result: 'codex-streamed',
         newSessionId: 'codex-thread-final',
+        threadId: 'codex-thread-final',
       });
-      return {
-        status: 'success',
-        result: 'codex-streamed',
-        newSessionId: 'codex-thread-final',
-      };
     });
 
     setRunnerSession('codex', 'test-group', 'codex-thread-existing');
@@ -288,5 +331,78 @@ describe('task scheduler', () => {
       }),
     );
     expect(getRunnerSession('codex', 'test-group')).toBe('codex-thread-final');
+  });
+
+  it('suppresses duplicate terminal outputs from the runner seam', async () => {
+    vi.mocked(runDefaultRunner).mockImplementation(async (args) => {
+      await args.onOutput?.(
+        output({
+          result: 'done',
+          newSessionId: 'session-123',
+          threadId: 'session-123',
+        }),
+      );
+      await args.onOutput?.(
+        output({
+          result: 'done',
+          newSessionId: 'session-123',
+          threadId: 'session-123',
+        }),
+      );
+
+      return output({
+        result: 'done',
+        newSessionId: 'session-123',
+        threadId: 'session-123',
+      });
+    });
+
+    createTask({
+      id: 'task-duplicate-final',
+      group_folder: 'test-group',
+      chat_jid: 'test@g.us',
+      prompt: 'run',
+      schedule_type: 'once',
+      schedule_value: '2026-02-22T00:00:00.000Z',
+      context_mode: 'group',
+      next_run: new Date(Date.now() - 60_000).toISOString(),
+      status: 'active',
+      created_at: '2026-02-22T00:00:00.000Z',
+    });
+
+    const enqueueTask = vi.fn(
+      (_groupJid: string, _taskId: string, fn: () => Promise<void>) => {
+        void fn();
+      },
+    );
+
+    const notifyIdle = vi.fn();
+    const closeStdin = vi.fn();
+    const sendMessage = vi.fn(async () => {});
+
+    startSchedulerLoop({
+      registeredGroups: () => ({
+        'test@g.us': {
+          name: 'Test Group',
+          folder: 'test-group',
+          trigger: '@Andy',
+          added_at: new Date().toISOString(),
+        },
+      }),
+      getSessions: () => ({ 'test-group': 'session-existing' }),
+      queue: {
+        enqueueTask,
+        notifyIdle,
+        closeStdin,
+      } as any,
+      onProcess: () => {},
+      sendMessage,
+    });
+
+    await vi.advanceTimersByTimeAsync(10);
+
+    expect(sendMessage).toHaveBeenCalledTimes(1);
+    expect(sendMessage).toHaveBeenCalledWith('test@g.us', 'done');
+    expect(notifyIdle).toHaveBeenCalledTimes(1);
   });
 });

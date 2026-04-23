@@ -23,7 +23,7 @@ describe('orchestration runner seam', () => {
       'utf-8',
     );
     const runnerSource = fs.readFileSync(
-      new URL('./runner.ts', import.meta.url),
+      new URL('./runners/shared/runner.ts', import.meta.url),
       'utf-8',
     );
 

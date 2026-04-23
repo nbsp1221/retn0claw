@@ -1,6 +1,7 @@
 import { ChildProcess } from 'child_process';
 import { CronExpressionParser } from 'cron-parser';
 import fs from 'fs';
+import { randomUUID } from 'crypto';
 
 import { ASSISTANT_NAME, SCHEDULER_POLL_INTERVAL, TIMEZONE } from './config.js';
 import {
@@ -17,9 +18,14 @@ import { logger } from './logger.js';
 import {
   clearRunnerSession,
   setRunnerSession,
-} from './runner-session-store.js';
-import { getSelectedRunnerKind, runDefaultRunner } from './runner.js';
+} from './runners/shared/runner-session-store.js';
+import {
+  getSelectedRunnerKind,
+  runDefaultRunner,
+} from './runners/shared/runner.js';
 import { RegisteredGroup, ScheduledTask } from './types.js';
+import { createRunnerOutputAuditLoggerFactory } from './runners/shared/delivery-audit.js';
+import { createDeliveryTurnManager } from './runners/shared/delivery-turn-manager.js';
 
 /**
  * Compute the next run time for a recurring task, anchored to the
@@ -131,13 +137,27 @@ async function runTask(
 
   const isMain = group.isMain === true;
   const tasks = getAllTasks();
+  const runnerKind = getSelectedRunnerKind();
 
   let result: string | null = null;
   let error: string | null = null;
+  const runId = randomUUID();
+  let latestSessionId: string | null = null;
+  const createAudit = createRunnerOutputAuditLoggerFactory(
+    {
+      groupFolder: task.group_folder,
+      chatJid: task.chat_jid,
+      runnerKind,
+      runId,
+    },
+    () => latestSessionId,
+  );
+  const deliveryTurnManager = createDeliveryTurnManager({
+    createAuditLogger: createAudit,
+  });
 
   // For group context mode, use the group's current session
   const sessions = deps.getSessions();
-  const runnerKind = getSelectedRunnerKind();
   const sessionStore = {
     get: () =>
       task.context_mode === 'group' ? sessions[task.group_folder] : undefined,
@@ -172,6 +192,7 @@ async function runTask(
       group,
       input: {
         prompt: task.prompt,
+        runId,
         sessionId: sessionStore.get(),
         groupFolder: task.group_folder,
         chatJid: task.chat_jid,
@@ -194,13 +215,27 @@ async function runTask(
       onProcess: (proc, runtimeHandle) =>
         deps.onProcess(task.chat_jid, proc, runtimeHandle, task.group_folder),
       onOutput: async (streamedOutput) => {
-        if (streamedOutput.result) {
-          result = streamedOutput.result;
+        if (streamedOutput.newSessionId) {
+          latestSessionId = streamedOutput.newSessionId;
+        }
+        const delivery = deliveryTurnManager.consume(streamedOutput);
+        if (delivery.sendText) {
+          result = delivery.sendText;
           // Forward result to user (sendMessage handles formatting)
-          await deps.sendMessage(task.chat_jid, streamedOutput.result);
+          try {
+            await deps.sendMessage(task.chat_jid, delivery.sendText);
+            createAudit(streamedOutput).finalSent(delivery.sendText);
+          } catch (sendError) {
+            createAudit(streamedOutput).finalFailed(
+              sendError instanceof Error
+                ? sendError.message
+                : String(sendError),
+            );
+            throw sendError;
+          }
           scheduleClose();
         }
-        if (streamedOutput.status === 'success') {
+        if (delivery.notifyIdle) {
           deps.queue.notifyIdle(task.chat_jid);
           scheduleClose(); // Close promptly even when result is null (e.g. IPC-only tasks)
         }
