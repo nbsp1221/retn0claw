@@ -143,6 +143,7 @@ function createMessage(overrides: {
   attachments?: Map<string, any>;
   reference?: { messageId?: string };
   mentionsBotId?: boolean;
+  repliedToBot?: boolean;
 }) {
   const channelId = overrides.channelId ?? '1234567890123456';
   const authorId = overrides.authorId ?? '55512345';
@@ -172,7 +173,14 @@ function createMessage(overrides: {
       name: overrides.channelName ?? 'general',
       messages: {
         fetch: vi.fn().mockResolvedValue({
-          author: { username: 'Bob', displayName: 'Bob' },
+          id: 'original_msg_id',
+          content: 'Original content',
+          author: {
+            id: overrides.repliedToBot ? botId : 'bob-id',
+            username: overrides.repliedToBot ? 'Andy' : 'Bob',
+            displayName: overrides.repliedToBot ? 'Andy' : 'Bob',
+            bot: overrides.repliedToBot ?? false,
+          },
           member: { displayName: 'Bob' },
         }),
       },
@@ -499,6 +507,17 @@ describe('DiscordChannel', () => {
         }),
       );
     });
+
+    it('exposes Discord ID mention forms as assistant aliases', async () => {
+      const opts = createTestOpts();
+      const channel = new DiscordChannel('test-token', opts);
+      await channel.connect();
+
+      expect(channel.getAssistantAliases?.('dc:1234567890123456')).toEqual([
+        '<@999888777>',
+        '<@!999888777>',
+      ]);
+    });
   });
 
   // --- Attachments ---
@@ -624,7 +643,7 @@ describe('DiscordChannel', () => {
   // --- Reply context ---
 
   describe('reply context', () => {
-    it('includes reply author in content', async () => {
+    it('stores structured reply metadata without mutating content', async () => {
       const opts = createTestOpts();
       const channel = new DiscordChannel('test-token', opts);
       await channel.connect();
@@ -633,13 +652,18 @@ describe('DiscordChannel', () => {
         content: 'I agree with that',
         reference: { messageId: 'original_msg_id' },
         guildName: 'Server',
+        repliedToBot: true,
       });
       await triggerMessage(msg);
 
       expect(opts.onMessage).toHaveBeenCalledWith(
         'dc:1234567890123456',
         expect.objectContaining({
-          content: '[Reply to Bob] I agree with that',
+          content: 'I agree with that',
+          reply_to_message_id: 'original_msg_id',
+          reply_to_message_content: 'Original content',
+          reply_to_sender_name: 'Bob',
+          reply_to_is_bot: true,
         }),
       );
     });

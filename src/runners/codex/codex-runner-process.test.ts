@@ -247,4 +247,92 @@ describe('codex runner process helper', () => {
       fs.rmSync(rootDir, { recursive: true, force: true });
     }
   });
+
+  it('steers queued prompts one at a time without joining complete chat-surface prompts', async () => {
+    vi.useRealTimers();
+    vi.resetModules();
+    const mod = await import('./codex-runner-process.js');
+    const rootDir = fs.mkdtempSync(
+      path.join(os.tmpdir(), 'codex-runner-queued-'),
+    );
+    const groupDir = path.join(rootDir, 'group');
+    const ipcDir = path.join(rootDir, 'ipc');
+    const inputDir = path.join(ipcDir, 'input');
+    fs.mkdirSync(groupDir, { recursive: true });
+    fs.mkdirSync(inputDir, { recursive: true });
+
+    const steeredTexts: string[] = [];
+    let interrupted = false;
+    let sleepCalls = 0;
+
+    try {
+      await mod.runCodexRunnerProcess(
+        {
+          prompt: 'initial prompt',
+          sessionId: 'thread-existing',
+          runId: 'run-queued',
+          groupFolder: 'group',
+          chatJid: 'tg:1',
+          isMain: false,
+        },
+        {
+          resolveGroupFolderPath: () => groupDir,
+          resolveGroupIpcPath: () => ipcDir,
+          sleep: async () => {
+            sleepCalls += 1;
+            if (sleepCalls === 1) {
+              fs.writeFileSync(
+                path.join(inputDir, '001.json'),
+                JSON.stringify({ type: 'message', text: 'prompt A' }),
+              );
+              fs.writeFileSync(
+                path.join(inputDir, '002.json'),
+                JSON.stringify({ type: 'message', text: 'prompt B' }),
+              );
+            }
+            await new Promise((resolve) => setTimeout(resolve, 1));
+          },
+          createClient: () => ({
+            async start() {},
+            async login() {},
+            async close() {},
+            async startOrResumeThread() {
+              return 'thread-existing';
+            },
+            async startTurn() {
+              return {
+                turnId: 'turn-queued',
+                async steer(input) {
+                  const first = input[0];
+                  steeredTexts.push(first?.type === 'text' ? first.text : '');
+                  if (steeredTexts.length >= 1) {
+                    fs.writeFileSync(path.join(inputDir, '_close'), '');
+                  }
+                },
+                async interrupt() {
+                  interrupted = true;
+                },
+                async wait() {
+                  while (!interrupted) {
+                    await new Promise((resolve) => setTimeout(resolve, 1));
+                  }
+                  return { status: 'interrupted', result: null };
+                },
+              };
+            },
+            recordHostEvent() {},
+            emitRunStarted() {},
+            emitSessionResumeAttempted() {},
+            emitSessionResumeFailed() {},
+            emitSessionReplaced() {},
+            emitSessionStuck() {},
+          }),
+        },
+      );
+
+      expect(steeredTexts).toEqual(['prompt A', 'prompt B']);
+    } finally {
+      fs.rmSync(rootDir, { recursive: true, force: true });
+    }
+  });
 });

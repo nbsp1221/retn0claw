@@ -6,6 +6,7 @@ import { OneCLI } from '@onecli-sh/sdk';
 
 import {
   ASSISTANT_NAME,
+  CHAT_CONTEXT_POLICY_CONFIG,
   DEFAULT_TRIGGER,
   getTriggerPattern,
   GROUPS_DIR,
@@ -13,6 +14,7 @@ import {
   MAX_MESSAGES_PER_PROMPT,
   ONECLI_URL,
   POLL_INTERVAL,
+  resolveChatContextPolicy,
   TIMEZONE,
 } from './config.js';
 import './channels/index.js';
@@ -34,6 +36,7 @@ import {
   getAllChats,
   getAllRegisteredGroups,
   getAllTasks,
+  getChatInfo,
   getLastBotMessageTimestamp,
   getMessagesSince,
   getNewMessages,
@@ -71,6 +74,7 @@ import {
 import { createRunnerOutputAuditLoggerFactory } from './runners/shared/delivery-audit.js';
 import { createDeliveryTurnManager } from './runners/shared/delivery-turn-manager.js';
 import { Channel, NewMessage, RegisteredGroup } from './types.js';
+import type { ChatPlatform, ChatType } from './types.js';
 import { logger } from './logger.js';
 import { assertCodexRunnerReadiness } from './runners/codex/codex-auth-store.js';
 import {
@@ -78,6 +82,11 @@ import {
   getRunnerSessions,
   setRunnerSession,
 } from './runners/shared/runner-session-store.js';
+import {
+  buildChatSurfacePrompt,
+  type ChatSurfaceMessage,
+  selectChatSurfaceMessages,
+} from './prompt/chat-surface.js';
 
 // Re-export for backwards compatibility during refactor
 export { escapeXml, formatMessages } from './router.js';
@@ -241,6 +250,131 @@ export function _setChannelsForTests(nextChannels: Channel[]): void {
   channels.push(...nextChannels);
 }
 
+function normalizePlatform(value: string | null | undefined): ChatPlatform {
+  return value === 'telegram' || value === 'discord' ? value : 'unknown';
+}
+
+function resolveChatType(chatJid: string): ChatType {
+  const chatInfo = getChatInfo(chatJid);
+  return chatInfo?.is_group === false ? 'dm' : 'group';
+}
+
+function toChatSurfaceMessage(message: NewMessage): ChatSurfaceMessage {
+  return {
+    id: message.id,
+    sender: message.sender,
+    senderName: message.sender_name,
+    timestamp: message.timestamp,
+    text: message.content,
+    replyToMessageId: message.reply_to_message_id,
+    replyToMessageContent: message.reply_to_message_content,
+    replyToSenderName: message.reply_to_sender_name,
+    replyToIsBot: message.reply_to_is_bot,
+  };
+}
+
+function buildCodexChatPrompt(
+  chatJid: string,
+  group: RegisteredGroup,
+  messages: NewMessage[],
+): { prompt: string | null; cursorTimestamp: string | null } {
+  const chatInfo = getChatInfo(chatJid);
+  const platform = normalizePlatform(chatInfo?.channel);
+  const chatType = resolveChatType(chatJid);
+  const channel = findChannel(channels, chatJid);
+  const assistantAliases = channel?.getAssistantAliases?.(chatJid) ?? [];
+  const contextPolicy = resolveChatContextPolicy({
+    chatType,
+    platform,
+    registeredGroup: group,
+    config: CHAT_CONTEXT_POLICY_CONFIG,
+  });
+  const allowlistCfg = loadSenderAllowlist();
+  const selected = selectChatSurfaceMessages({
+    messages,
+    chatType,
+    trigger: group.trigger,
+    assistantAliases,
+    contextPolicy,
+    isGroupMessageAllowed: (message) =>
+      message.is_from_me ||
+      isTriggerAllowed(chatJid, message.sender, allowlistCfg),
+  });
+
+  if (!selected.latestMessage || !selected.addressedBy) {
+    return {
+      prompt: null,
+      cursorTimestamp:
+        contextPolicy === 'recent_all' ? null : selected.cursorTimestamp,
+    };
+  }
+
+  return {
+    prompt: buildChatSurfacePrompt({
+      platform,
+      chatType,
+      chatName: chatInfo?.name ?? group.name,
+      assistantName: ASSISTANT_NAME,
+      trigger: group.trigger,
+      assistantAliases,
+      contextPolicy,
+      addressedBy: selected.addressedBy,
+      timezone: TIMEZONE,
+      recentMessages: selected.recentMessages.map(toChatSurfaceMessage),
+      latestMessage: toChatSurfaceMessage(selected.latestMessage),
+    }),
+    cursorTimestamp: selected.cursorTimestamp,
+  };
+}
+
+function hasAllowedLegacyTrigger(
+  chatJid: string,
+  group: RegisteredGroup,
+  messages: NewMessage[],
+): boolean {
+  const triggerPattern = getTriggerPattern(group.trigger);
+  const allowlistCfg = loadSenderAllowlist();
+  return messages.some(
+    (message) =>
+      triggerPattern.test(message.content.trim()) &&
+      (message.is_from_me ||
+        isTriggerAllowed(chatJid, message.sender, allowlistCfg)),
+  );
+}
+
+function buildRunnerPrompt(input: {
+  chatJid: string;
+  group: RegisteredGroup;
+  messages: NewMessage[];
+  runnerKind: RunnerKind;
+  legacyTriggerMessages?: NewMessage[];
+}): { prompt: string | null; cursorTimestamp: string | null } {
+  if (input.messages.length === 0) {
+    return { prompt: null, cursorTimestamp: null };
+  }
+
+  if (input.runnerKind === 'codex') {
+    return buildCodexChatPrompt(input.chatJid, input.group, input.messages);
+  }
+
+  if (
+    input.group.isMain !== true &&
+    input.group.requiresTrigger !== false &&
+    !hasAllowedLegacyTrigger(
+      input.chatJid,
+      input.group,
+      input.legacyTriggerMessages ?? input.messages,
+    )
+  ) {
+    return { prompt: null, cursorTimestamp: null };
+  }
+
+  return {
+    prompt: formatMessages(input.messages, TIMEZONE),
+    cursorTimestamp: input.messages[input.messages.length - 1].timestamp,
+  };
+}
+
 /**
  * Process all pending messages for a group.
  * Called by the GroupQueue when it's this group's turn.
@@ -255,8 +389,6 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
     return true;
   }
 
-  const isMainGroup = group.isMain === true;
-
   const missedMessages = getMessagesSince(
     chatJid,
     getOrRecoverCursor(chatJid),
@@ -266,25 +398,28 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
 
   if (missedMessages.length === 0) return true;
 
-  // For non-main groups, check if trigger is required and present
-  if (!isMainGroup && group.requiresTrigger !== false) {
-    const triggerPattern = getTriggerPattern(group.trigger);
-    const allowlistCfg = loadSenderAllowlist();
-    const hasTrigger = missedMessages.some(
-      (m) =>
-        triggerPattern.test(m.content.trim()) &&
-        (m.is_from_me || isTriggerAllowed(chatJid, m.sender, allowlistCfg)),
-    );
-    if (!hasTrigger) return true;
+  const builtPrompt = buildRunnerPrompt({
+    chatJid,
+    group,
+    messages: missedMessages,
+    runnerKind: getSelectedRunnerKind(),
+  });
+  if (!builtPrompt.prompt) {
+    if (builtPrompt.cursorTimestamp) {
+      lastAgentTimestamp[chatJid] = builtPrompt.cursorTimestamp;
+      saveState();
+    }
+    return true;
   }
-
-  const prompt = formatMessages(missedMessages, TIMEZONE);
+  const prompt = builtPrompt.prompt;
+  const cursorTimestamp =
+    builtPrompt.cursorTimestamp ??
+    missedMessages[missedMessages.length - 1].timestamp;
 
   // Advance cursor so the piping path in startMessageLoop won't re-fetch
   // these messages. Save the old cursor so we can roll back on error.
   const previousCursor = lastAgentTimestamp[chatJid] || '';
-  lastAgentTimestamp[chatJid] =
-    missedMessages[missedMessages.length - 1].timestamp;
+  lastAgentTimestamp[chatJid] = cursorTimestamp;
   saveState();
 
   logger.info(
@@ -517,20 +652,15 @@ async function startMessageLoop(): Promise<void> {
 
           const isMainGroup = group.isMain === true;
           const needsTrigger = !isMainGroup && group.requiresTrigger !== false;
+          const runnerKindForPrompt = getSelectedRunnerKind();
 
           // For non-main groups, only act on trigger messages.
           // Non-trigger messages accumulate in DB and get pulled as
           // context when a trigger eventually arrives.
-          if (needsTrigger) {
-            const triggerPattern = getTriggerPattern(group.trigger);
-            const allowlistCfg = loadSenderAllowlist();
-            const hasTrigger = groupMessages.some(
-              (m) =>
-                triggerPattern.test(m.content.trim()) &&
-                (m.is_from_me ||
-                  isTriggerAllowed(chatJid, m.sender, allowlistCfg)),
-            );
-            if (!hasTrigger) continue;
+          if (needsTrigger && runnerKindForPrompt !== 'codex') {
+            if (!hasAllowedLegacyTrigger(chatJid, group, groupMessages)) {
+              continue;
+            }
           }
 
           // Pull all messages since lastAgentTimestamp so non-trigger
@@ -543,15 +673,31 @@ async function startMessageLoop(): Promise<void> {
           );
           const messagesToSend =
             allPending.length > 0 ? allPending : groupMessages;
-          const formatted = formatMessages(messagesToSend, TIMEZONE);
+          const builtPrompt = buildRunnerPrompt({
+            chatJid,
+            group,
+            messages: messagesToSend,
+            runnerKind: runnerKindForPrompt,
+            legacyTriggerMessages: groupMessages,
+          });
+          if (!builtPrompt.prompt) {
+            if (builtPrompt.cursorTimestamp) {
+              lastAgentTimestamp[chatJid] = builtPrompt.cursorTimestamp;
+              saveState();
+            }
+            continue;
+          }
+          const formatted = builtPrompt.prompt;
+          const cursorTimestamp =
+            builtPrompt.cursorTimestamp ??
+            messagesToSend[messagesToSend.length - 1].timestamp;
 
           if (queue.sendMessage(chatJid, formatted)) {
             logger.debug(
               { chatJid, count: messagesToSend.length },
               'Piped messages to active container',
             );
-            lastAgentTimestamp[chatJid] =
-              messagesToSend[messagesToSend.length - 1].timestamp;
+            lastAgentTimestamp[chatJid] = cursorTimestamp;
             saveState();
             // Show typing indicator while the container processes the piped message
             channel

@@ -3,6 +3,13 @@ import path from 'path';
 
 import { readEnvFile } from './env.js';
 import { isValidTimezone } from './timezone.js';
+import { isChatContextPolicy } from './chat-context-policy.js';
+import type {
+  ChatContextPolicy,
+  ChatPlatform,
+  ChatType,
+  RegisteredGroup,
+} from './types.js';
 
 // Read config values from .env (falls back to process.env).
 const envConfig = readEnvFile([
@@ -11,6 +18,7 @@ const envConfig = readEnvFile([
   'CODEX_EFFORT',
   'CODEX_MODEL',
   'CODEX_OAUTH_TOKEN_STORE_PATH',
+  'CHAT_CONTEXT_POLICY',
   'DEFAULT_RUNNER',
   'ONECLI_URL',
   'ONECLI_API_KEY',
@@ -86,6 +94,82 @@ export function getTriggerPattern(trigger?: string): RegExp {
 }
 
 export const TRIGGER_PATTERN = buildTriggerPattern(DEFAULT_TRIGGER);
+
+export interface ChatContextPolicyConfig {
+  defaults?: Partial<Record<ChatType, ChatContextPolicy>>;
+  channels?: Partial<
+    Record<ChatPlatform, Partial<Record<ChatType, ChatContextPolicy>>>
+  >;
+}
+
+const CHAT_PLATFORMS = new Set<ChatPlatform>([
+  'telegram',
+  'discord',
+  'unknown',
+]);
+
+function normalizePolicyMap(
+  value: unknown,
+): Partial<Record<ChatType, ChatContextPolicy>> | undefined {
+  if (!value || typeof value !== 'object') return undefined;
+  const record = value as Record<string, unknown>;
+  const result: Partial<Record<ChatType, ChatContextPolicy>> = {};
+  if (isChatContextPolicy(record.dm)) result.dm = record.dm;
+  if (isChatContextPolicy(record.group)) result.group = record.group;
+  return Object.keys(result).length > 0 ? result : undefined;
+}
+
+export function parseChatContextPolicyConfig(
+  raw?: string,
+): ChatContextPolicyConfig {
+  if (!raw?.trim()) return {};
+
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    return {};
+  }
+
+  if (!parsed || typeof parsed !== 'object') return {};
+  const record = parsed as Record<string, unknown>;
+  const defaults = normalizePolicyMap(record.defaults);
+  const channels: ChatContextPolicyConfig['channels'] = {};
+
+  if (record.channels && typeof record.channels === 'object') {
+    for (const [platform, value] of Object.entries(
+      record.channels as Record<string, unknown>,
+    )) {
+      if (!CHAT_PLATFORMS.has(platform as ChatPlatform)) continue;
+      const normalized = normalizePolicyMap(value);
+      if (normalized) channels[platform as ChatPlatform] = normalized;
+    }
+  }
+
+  return {
+    ...(defaults ? { defaults } : {}),
+    ...(Object.keys(channels).length > 0 ? { channels } : {}),
+  };
+}
+
+export function resolveChatContextPolicy(input: {
+  chatType: ChatType;
+  platform: ChatPlatform;
+  registeredGroup?: Pick<RegisteredGroup, 'contextPolicy'>;
+  config?: ChatContextPolicyConfig;
+}): ChatContextPolicy {
+  const builtInDefault = input.chatType === 'dm' ? 'current' : 'addressed_only';
+  return (
+    input.registeredGroup?.contextPolicy ??
+    input.config?.channels?.[input.platform]?.[input.chatType] ??
+    input.config?.defaults?.[input.chatType] ??
+    builtInDefault
+  );
+}
+
+export const CHAT_CONTEXT_POLICY_CONFIG = parseChatContextPolicyConfig(
+  process.env.CHAT_CONTEXT_POLICY || envConfig.CHAT_CONTEXT_POLICY,
+);
 
 // Timezone for scheduled tasks, message formatting, etc.
 // Validates each candidate is a real IANA identifier before accepting.

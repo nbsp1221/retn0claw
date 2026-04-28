@@ -409,10 +409,10 @@ export async function runCodexRunnerProcess(
         const queued = readQueuedMessages(ipcInputDir);
         if (queued.length > 0) {
           try {
-            await turn.steer(
-              parseInputItems(queued.map((q) => q.text).join('\n')),
-            );
-            acknowledgeQueuedMessages(queued);
+            for (const entry of queued) {
+              await turn.steer(parseInputItems(entry.text));
+              acknowledgeQueuedMessages([entry]);
+            }
           } catch (error) {
             console.error(
               `[codex-runner-process] steer failed: ${

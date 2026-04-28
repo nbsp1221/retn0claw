@@ -151,7 +151,7 @@ function createTextCtx(overrides: {
       reply_to_message: overrides.reply_to_message,
       message_thread_id: overrides.message_thread_id,
     },
-    me: { username: 'andy_ai_bot' },
+    me: { id: 12345, username: 'andy_ai_bot' },
     reply: vi.fn(),
   };
 }
@@ -184,7 +184,7 @@ function createMediaCtx(overrides: {
       caption: overrides.caption,
       ...(overrides.extra || {}),
     },
-    me: { username: 'andy_ai_bot' },
+    me: { id: 12345, username: 'andy_ai_bot' },
   };
 }
 
@@ -630,6 +630,16 @@ describe('TelegramChannel', () => {
         }),
       );
     });
+
+    it('exposes Telegram bot username as an assistant alias', async () => {
+      const opts = createTestOpts();
+      const channel = new TelegramChannel('test-token', opts);
+      await channel.connect();
+
+      expect(channel.getAssistantAliases?.('tg:100200300')).toEqual([
+        '@andy_ai_bot',
+      ]);
+    });
   });
 
   // --- Reply context ---
@@ -645,7 +655,7 @@ describe('TelegramChannel', () => {
         reply_to_message: {
           message_id: 42,
           text: 'Are you coming tonight?',
-          from: { id: 777, first_name: 'Bob', username: 'bob_user' },
+          from: { id: 12345, first_name: 'Andy', username: 'andy_ai_bot' },
         },
       });
       await triggerTextMessage(ctx);
@@ -656,7 +666,8 @@ describe('TelegramChannel', () => {
           content: 'Yes, on my way!',
           reply_to_message_id: '42',
           reply_to_message_content: 'Are you coming tonight?',
-          reply_to_sender_name: 'Bob',
+          reply_to_sender_name: 'Andy',
+          reply_to_is_bot: true,
         }),
       );
     });

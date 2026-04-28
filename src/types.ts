@@ -32,6 +32,15 @@ export interface ContainerConfig {
   timeout?: number; // Default: 300000 (5 minutes)
 }
 
+export type ChatContextPolicy =
+  | 'current'
+  | 'addressed_only'
+  | 'recent_addressed'
+  | 'recent_all';
+
+export type ChatType = 'dm' | 'group';
+export type ChatPlatform = 'telegram' | 'discord' | 'unknown';
+
 export interface RegisteredGroup {
   name: string;
   folder: string;
@@ -40,6 +49,7 @@ export interface RegisteredGroup {
   containerConfig?: ContainerConfig;
   requiresTrigger?: boolean; // Default: true for groups, false for solo chats
   isMain?: boolean; // True for the main control group (no trigger, elevated privileges)
+  contextPolicy?: ChatContextPolicy;
 }
 
 export interface NewMessage {
@@ -55,6 +65,7 @@ export interface NewMessage {
   reply_to_message_id?: string;
   reply_to_message_content?: string;
   reply_to_sender_name?: string;
+  reply_to_is_bot?: boolean | null;
 }
 
 export interface ScheduledTask {
@@ -95,6 +106,8 @@ export interface Channel {
   setTyping?(jid: string, isTyping: boolean): Promise<void>;
   // Optional: sync group/chat names from the platform.
   syncGroups?(force: boolean): Promise<void>;
+  // Optional: transport-native bot aliases for mention cleanup and routing.
+  getAssistantAliases?(jid: string): string[];
 }
 
 // Callback type that channels use to deliver inbound messages

@@ -661,6 +661,25 @@ describe('register_group success', () => {
     expect(group!.trigger).toBe('@Andy');
   });
 
+  it('main group can set a room context policy when registering a group', async () => {
+    await processTaskIpc(
+      {
+        type: 'register_group',
+        jid: 'policy@g.us',
+        name: 'Policy Group',
+        folder: 'policy-group',
+        trigger: '@Andy',
+        contextPolicy: 'recent_all',
+      },
+      'whatsapp_main',
+      true,
+      deps,
+    );
+
+    const group = getRegisteredGroup('policy@g.us');
+    expect(group?.contextPolicy).toBe('recent_all');
+  });
+
   it('register_group rejects request with missing fields', async () => {
     await processTaskIpc(
       {

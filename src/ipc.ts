@@ -5,6 +5,7 @@ import { CronExpressionParser } from 'cron-parser';
 
 import { DATA_DIR, IPC_POLL_INTERVAL, TIMEZONE } from './config.js';
 import { createTask, deleteTask, getTaskById, updateTask } from './db.js';
+import { parseChatContextPolicy } from './chat-context-policy.js';
 import { isValidGroupFolder } from './group-folder.js';
 import { logger } from './logger.js';
 import { type AvailableGroup } from './runners/shared/runner-artifacts.js';
@@ -173,6 +174,7 @@ export async function processTaskIpc(
     trigger?: string;
     requiresTrigger?: boolean;
     containerConfig?: RegisteredGroup['containerConfig'];
+    contextPolicy?: string;
   },
   sourceGroup: string, // Verified identity from IPC directory
   isMain: boolean, // Verified from directory path
@@ -453,6 +455,9 @@ export async function processTaskIpc(
           containerConfig: data.containerConfig,
           requiresTrigger: data.requiresTrigger,
           isMain: existingGroup?.isMain,
+          contextPolicy:
+            parseChatContextPolicy(data.contextPolicy) ??
+            existingGroup?.contextPolicy,
         });
       } else {
         logger.warn(

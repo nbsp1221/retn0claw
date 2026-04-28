@@ -54,6 +54,7 @@ export class TelegramChannel implements Channel {
   private botToken: string;
   private started = false;
   private telegramFetch = createTelegramFetch();
+  private botUsername: string | undefined;
 
   constructor(botToken: string, opts: TelegramChannelOpts) {
     this.botToken = botToken;
@@ -164,6 +165,10 @@ export class TelegramChannel implements Channel {
       const replyTo = ctx.message.reply_to_message;
       const replyToMessageId = replyTo?.message_id?.toString();
       const replyToContent = replyTo?.text || replyTo?.caption;
+      const replyToIsBot =
+        replyTo?.from?.id !== undefined && ctx.me?.id !== undefined
+          ? replyTo.from.id === ctx.me.id
+          : undefined;
       const replyToSenderName = replyTo
         ? replyTo.from?.first_name ||
           replyTo.from?.username ||
@@ -238,6 +243,7 @@ export class TelegramChannel implements Channel {
         reply_to_message_id: replyToMessageId,
         reply_to_message_content: replyToContent,
         reply_to_sender_name: replyToSenderName,
+        reply_to_is_bot: replyToIsBot,
       });
 
       logger.info(
@@ -383,6 +389,7 @@ export class TelegramChannel implements Channel {
             if (settled) return;
             settled = true;
             this.started = true;
+            this.botUsername = botInfo.username;
             logger.info(
               { username: botInfo.username, id: botInfo.id },
               'Telegram bot connected',
@@ -436,6 +443,10 @@ export class TelegramChannel implements Channel {
 
   ownsJid(jid: string): boolean {
     return jid.startsWith('tg:');
+  }
+
+  getAssistantAliases(_jid: string): string[] {
+    return this.botUsername ? [`@${this.botUsername}`] : [];
   }
 
   async disconnect(): Promise<void> {

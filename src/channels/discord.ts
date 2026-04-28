@@ -59,6 +59,10 @@ export class DiscordChannel implements Channel {
         message.author.username;
       const sender = message.author.id;
       const msgId = message.id;
+      let replyToMessageId: string | undefined;
+      let replyToMessageContent: string | undefined;
+      let replyToSenderName: string | undefined;
+      let replyToIsBot: boolean | undefined;
 
       // Determine chat name
       let chatName: string;
@@ -121,11 +125,16 @@ export class DiscordChannel implements Channel {
           const repliedTo = await message.channel.messages.fetch(
             message.reference.messageId,
           );
-          const replyAuthor =
+          replyToMessageId = message.reference.messageId;
+          replyToMessageContent = repliedTo.content;
+          replyToSenderName =
             repliedTo.member?.displayName ||
             repliedTo.author.displayName ||
             repliedTo.author.username;
-          content = `[Reply to ${replyAuthor}] ${content}`;
+          replyToIsBot =
+            this.client?.user?.id !== undefined
+              ? repliedTo.author.id === this.client.user.id
+              : undefined;
         } catch {
           // Referenced message may have been deleted
         }
@@ -160,6 +169,10 @@ export class DiscordChannel implements Channel {
         content,
         timestamp,
         is_from_me: false,
+        reply_to_message_id: replyToMessageId,
+        reply_to_message_content: replyToMessageContent,
+        reply_to_sender_name: replyToSenderName,
+        reply_to_is_bot: replyToIsBot,
       });
 
       logger.info(
@@ -236,6 +249,11 @@ export class DiscordChannel implements Channel {
 
   ownsJid(jid: string): boolean {
     return jid.startsWith('dc:');
+  }
+
+  getAssistantAliases(_jid: string): string[] {
+    const botId = this.client?.user?.id;
+    return botId ? [`<@${botId}>`, `<@!${botId}>`] : [];
   }
 
   async disconnect(): Promise<void> {

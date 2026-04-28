@@ -6,6 +6,7 @@ import {
   deleteTask,
   getAllChats,
   getAllRegisteredGroups,
+  getChatInfo,
   getLastBotMessageTimestamp,
   getMessagesSince,
   getNewMessages,
@@ -158,6 +159,7 @@ describe('reply context', () => {
       reply_to_message_id: '42',
       reply_to_message_content: 'Are you coming tonight?',
       reply_to_sender_name: 'Bob',
+      reply_to_is_bot: true,
     });
 
     const messages = getMessagesSince(
@@ -171,6 +173,7 @@ describe('reply context', () => {
       'Are you coming tonight?',
     );
     expect(messages[0].reply_to_sender_name).toBe('Bob');
+    expect(messages[0].reply_to_is_bot).toBe(true);
   });
 
   it('returns null for messages without reply context', () => {
@@ -194,6 +197,7 @@ describe('reply context', () => {
     expect(messages[0].reply_to_message_id).toBeNull();
     expect(messages[0].reply_to_message_content).toBeNull();
     expect(messages[0].reply_to_sender_name).toBeNull();
+    expect(messages[0].reply_to_is_bot).toBe(false);
   });
 
   it('retrieves reply context via getNewMessages', () => {
@@ -209,6 +213,7 @@ describe('reply context', () => {
       reply_to_message_id: '99',
       reply_to_message_content: 'We should meet',
       reply_to_sender_name: 'Dave',
+      reply_to_is_bot: true,
     });
 
     const { messages } = getNewMessages(
@@ -219,6 +224,7 @@ describe('reply context', () => {
     expect(messages).toHaveLength(1);
     expect(messages[0].reply_to_message_id).toBe('99');
     expect(messages[0].reply_to_sender_name).toBe('Dave');
+    expect(messages[0].reply_to_is_bot).toBe(true);
   });
 });
 
@@ -497,6 +503,25 @@ describe('storeChatMetadata', () => {
     const chats = getAllChats();
     expect(chats[0].last_message_time).toBe('2024-01-01T00:00:05.000Z');
   });
+
+  it('retrieves one chat metadata row by jid', () => {
+    storeChatMetadata(
+      'tg:-100',
+      '2024-01-01T00:00:00.000Z',
+      '루나방',
+      'telegram',
+      true,
+    );
+
+    expect(getChatInfo('tg:-100')).toEqual({
+      jid: 'tg:-100',
+      name: '루나방',
+      last_message_time: '2024-01-01T00:00:00.000Z',
+      channel: 'telegram',
+      is_group: true,
+    });
+    expect(getChatInfo('missing')).toBeUndefined();
+  });
 });
 
 // --- Task CRUD ---
@@ -648,5 +673,18 @@ describe('registered group isMain', () => {
     const group = groups['group@g.us'];
     expect(group).toBeDefined();
     expect(group.isMain).toBeUndefined();
+  });
+
+  it('persists contextPolicy through set/get round-trip', () => {
+    setRegisteredGroup('group@g.us', {
+      name: 'Family Chat',
+      folder: 'whatsapp_family-chat',
+      trigger: '@Andy',
+      added_at: '2024-01-01T00:00:00.000Z',
+      contextPolicy: 'recent_all',
+    });
+
+    const groups = getAllRegisteredGroups();
+    expect(groups['group@g.us']?.contextPolicy).toBe('recent_all');
   });
 });

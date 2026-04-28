@@ -3,6 +3,7 @@ import fs from 'fs';
 import path from 'path';
 
 import { ASSISTANT_NAME, DATA_DIR, STORE_DIR } from './config.js';
+import { parseChatContextPolicy } from './chat-context-policy.js';
 import { isValidGroupFolder } from './group-folder.js';
 import { logger } from './logger.js';
 import {
@@ -86,7 +87,8 @@ function createSchema(database: Database.Database): void {
       trigger_pattern TEXT NOT NULL,
       added_at TEXT NOT NULL,
       container_config TEXT,
-      requires_trigger INTEGER DEFAULT 1
+      requires_trigger INTEGER DEFAULT 1,
+      context_policy TEXT
     );
   `);
 
@@ -147,7 +149,10 @@ function createSchema(database: Database.Database): void {
       `UPDATE chats SET channel = 'discord', is_group = 1 WHERE jid LIKE 'dc:%'`,
     );
     database.exec(
-      `UPDATE chats SET channel = 'telegram', is_group = 0 WHERE jid LIKE 'tg:%'`,
+      `UPDATE chats SET channel = 'telegram', is_group = 1 WHERE jid LIKE 'tg:-%'`,
+    );
+    database.exec(
+      `UPDATE chats SET channel = 'telegram', is_group = 0 WHERE jid LIKE 'tg:%' AND jid NOT LIKE 'tg:-%'`,
     );
   } catch {
     /* columns already exist */
@@ -162,6 +167,24 @@ function createSchema(database: Database.Database): void {
     database.exec(`ALTER TABLE messages ADD COLUMN reply_to_sender_name TEXT`);
   } catch {
     /* columns already exist */
+  }
+
+  // Add reply-to-bot metadata if it doesn't exist (migration for existing DBs)
+  try {
+    database.exec(
+      `ALTER TABLE messages ADD COLUMN reply_to_is_bot INTEGER DEFAULT 0`,
+    );
+  } catch {
+    /* column already exists */
+  }
+
+  // Add context policy override if it doesn't exist (migration for existing DBs)
+  try {
+    database.exec(
+      `ALTER TABLE registered_groups ADD COLUMN context_policy TEXT`,
+    );
+  } catch {
+    /* column already exists */
   }
 }
 
@@ -253,6 +276,14 @@ export interface ChatInfo {
   is_group: number;
 }
 
+export interface ChatMetadata {
+  jid: string;
+  name: string;
+  last_message_time: string;
+  channel: string | null;
+  is_group: boolean | null;
+}
+
 /**
  * Get all known chats, ordered by most recent activity.
  */
@@ -266,6 +297,34 @@ export function getAllChats(): ChatInfo[] {
   `,
     )
     .all() as ChatInfo[];
+}
+
+export function getChatInfo(jid: string): ChatMetadata | undefined {
+  const row = db
+    .prepare(
+      `
+    SELECT jid, name, last_message_time, channel, is_group
+    FROM chats
+    WHERE jid = ?
+  `,
+    )
+    .get(jid) as
+    | {
+        jid: string;
+        name: string;
+        last_message_time: string;
+        channel: string | null;
+        is_group: number | null;
+      }
+    | undefined;
+  if (!row) return undefined;
+  return {
+    jid: row.jid,
+    name: row.name,
+    last_message_time: row.last_message_time,
+    channel: row.channel,
+    is_group: row.is_group === null ? null : row.is_group === 1,
+  };
 }
 
 /**
@@ -295,7 +354,7 @@ export function setLastGroupSync(): void {
  */
 export function storeMessage(msg: NewMessage): void {
   db.prepare(
-    `INSERT OR REPLACE INTO messages (id, chat_jid, sender, sender_name, content, timestamp, is_from_me, is_bot_message, reply_to_message_id, reply_to_message_content, reply_to_sender_name) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    `INSERT OR REPLACE INTO messages (id, chat_jid, sender, sender_name, content, timestamp, is_from_me, is_bot_message, reply_to_message_id, reply_to_message_content, reply_to_sender_name, reply_to_is_bot) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
   ).run(
     msg.id,
     msg.chat_jid,
@@ -308,6 +367,7 @@ export function storeMessage(msg: NewMessage): void {
     msg.reply_to_message_id ?? null,
     msg.reply_to_message_content ?? null,
     msg.reply_to_sender_name ?? null,
+    msg.reply_to_is_bot ? 1 : 0,
   );
 }
 
@@ -353,7 +413,8 @@ export function getNewMessages(
   const sql = `
     SELECT * FROM (
       SELECT id, chat_jid, sender, sender_name, content, timestamp, is_from_me,
-             reply_to_message_id, reply_to_message_content, reply_to_sender_name
+             reply_to_message_id, reply_to_message_content, reply_to_sender_name,
+             reply_to_is_bot
       FROM messages
       WHERE timestamp > ? AND chat_jid IN (${placeholders})
         AND is_bot_message = 0 AND content NOT LIKE ?
@@ -365,14 +426,22 @@ export function getNewMessages(
 
   const rows = db
     .prepare(sql)
-    .all(lastTimestamp, ...jids, `${botPrefix}:%`, limit) as NewMessage[];
+    .all(lastTimestamp, ...jids, `${botPrefix}:%`, limit) as Array<
+    Omit<NewMessage, 'reply_to_is_bot'> & { reply_to_is_bot: number | null }
+  >;
 
   let newTimestamp = lastTimestamp;
   for (const row of rows) {
     if (row.timestamp > newTimestamp) newTimestamp = row.timestamp;
   }
 
-  return { messages: rows, newTimestamp };
+  return {
+    messages: rows.map((row) => ({
+      ...row,
+      reply_to_is_bot: row.reply_to_is_bot === 1,
+    })),
+    newTimestamp,
+  };
 }
 
 export function getMessagesSince(
@@ -387,7 +456,8 @@ export function getMessagesSince(
   const sql = `
     SELECT * FROM (
       SELECT id, chat_jid, sender, sender_name, content, timestamp, is_from_me,
-             reply_to_message_id, reply_to_message_content, reply_to_sender_name
+             reply_to_message_id, reply_to_message_content, reply_to_sender_name,
+             reply_to_is_bot
       FROM messages
       WHERE chat_jid = ? AND timestamp > ?
         AND is_bot_message = 0 AND content NOT LIKE ?
@@ -396,9 +466,15 @@ export function getMessagesSince(
       LIMIT ?
     ) ORDER BY timestamp
   `;
-  return db
+  const rows = db
     .prepare(sql)
-    .all(chatJid, sinceTimestamp, `${botPrefix}:%`, limit) as NewMessage[];
+    .all(chatJid, sinceTimestamp, `${botPrefix}:%`, limit) as Array<
+    Omit<NewMessage, 'reply_to_is_bot'> & { reply_to_is_bot: number | null }
+  >;
+  return rows.map((row) => ({
+    ...row,
+    reply_to_is_bot: row.reply_to_is_bot === 1,
+  }));
 }
 
 export function getLastBotMessageTimestamp(
@@ -676,6 +752,7 @@ export function getRegisteredGroup(
         container_config: string | null;
         requires_trigger: number | null;
         is_main: number | null;
+        context_policy: string | null;
       }
     | undefined;
   if (!row) return undefined;
@@ -698,6 +775,7 @@ export function getRegisteredGroup(
     requiresTrigger:
       row.requires_trigger === null ? undefined : row.requires_trigger === 1,
     isMain: row.is_main === 1 ? true : undefined,
+    contextPolicy: parseChatContextPolicy(row.context_policy),
   };
 }
 
@@ -706,8 +784,8 @@ export function setRegisteredGroup(jid: string, group: RegisteredGroup): void {
     throw new Error(`Invalid group folder "${group.folder}" for JID ${jid}`);
   }
   db.prepare(
-    `INSERT OR REPLACE INTO registered_groups (jid, name, folder, trigger_pattern, added_at, container_config, requires_trigger, is_main)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+    `INSERT OR REPLACE INTO registered_groups (jid, name, folder, trigger_pattern, added_at, container_config, requires_trigger, is_main, context_policy)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
   ).run(
     jid,
     group.name,
@@ -717,6 +795,7 @@ export function setRegisteredGroup(jid: string, group: RegisteredGroup): void {
     group.containerConfig ? JSON.stringify(group.containerConfig) : null,
     group.requiresTrigger === undefined ? 1 : group.requiresTrigger ? 1 : 0,
     group.isMain ? 1 : 0,
+    group.contextPolicy ?? null,
   );
 }
 
@@ -730,6 +809,7 @@ export function getAllRegisteredGroups(): Record<string, RegisteredGroup> {
     container_config: string | null;
     requires_trigger: number | null;
     is_main: number | null;
+    context_policy: string | null;
   }>;
   const result: Record<string, RegisteredGroup> = {};
   for (const row of rows) {
@@ -751,6 +831,7 @@ export function getAllRegisteredGroups(): Record<string, RegisteredGroup> {
       requiresTrigger:
         row.requires_trigger === null ? undefined : row.requires_trigger === 1,
       isMain: row.is_main === 1 ? true : undefined,
+      contextPolicy: parseChatContextPolicy(row.context_policy),
     };
   }
   return result;
