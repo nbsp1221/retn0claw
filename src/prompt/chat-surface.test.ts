@@ -184,6 +184,68 @@ describe('buildChatSurfacePrompt', () => {
     expect(prompt).toContain('&lt;ops &amp; friends&gt;');
   });
 
+  it('renders escaped quoted metadata for the selected latest reply-to-bot message', () => {
+    const prompt = buildChatSurfacePrompt({
+      platform: 'telegram',
+      chatType: 'group',
+      chatName: 'ops',
+      assistantName: 'Andy',
+      trigger: '@Andy',
+      assistantAliases: [],
+      contextPolicy: 'addressed_only',
+      addressedBy: 'reply_to_bot',
+      timezone: 'UTC',
+      recentMessages: [],
+      latestMessage: {
+        id: '1',
+        sender: 'user-1',
+        senderName: 'retn0',
+        timestamp: '2026-04-24T00:49:18.000Z',
+        text: '이어서 설명해줘',
+        replyToMessageId: '77',
+        replyToSenderName: 'Andy <bot>',
+        replyToMessageContent: 'A는 <사과> & 배',
+        replyToIsBot: true,
+      },
+    });
+
+    expect(prompt).toContain(
+      '<quoted_message sender="Andy &lt;bot&gt;">A는 &lt;사과&gt; &amp; 배</quoted_message>',
+    );
+    expect(prompt).toContain('<latest_message');
+    expect(prompt).toContain('이어서 설명해줘');
+  });
+
+  it('does not render quoted latest metadata for Discord during Telegram thread Phase 1', () => {
+    const prompt = buildChatSurfacePrompt({
+      platform: 'discord',
+      chatType: 'group',
+      chatName: '#ops',
+      assistantName: 'Nova',
+      trigger: '@Nova',
+      assistantAliases: ['<@123>'],
+      contextPolicy: 'addressed_only',
+      addressedBy: 'reply_to_bot',
+      timezone: 'UTC',
+      recentMessages: [],
+      latestMessage: {
+        id: '1',
+        sender: 'user-1',
+        senderName: 'retn0',
+        timestamp: '2026-04-24T00:49:18.000Z',
+        text: 'continue',
+        replyToMessageId: '77',
+        replyToSenderName: 'Nova',
+        replyToMessageContent: 'quoted discord content',
+        replyToIsBot: true,
+      },
+    });
+
+    expect(prompt).not.toContain('<quoted_message');
+    expect(prompt).not.toContain('quoted discord content');
+    expect(prompt).toContain('continue');
+  });
+
   it('does not interpolate raw trigger text into trusted instruction prose', () => {
     const prompt = buildChatSurfacePrompt({
       platform: 'telegram',
@@ -294,6 +356,29 @@ describe('selectChatSurfaceMessages', () => {
 
     expect(selected.latestMessage).toBeNull();
     expect(selected.addressedBy).toBeNull();
+  });
+
+  it('does not select unaddressed reply-to-human quoted content by default', () => {
+    const selected = selectChatSurfaceMessages({
+      chatType: 'group',
+      trigger: '@Andy',
+      assistantAliases: [],
+      contextPolicy: 'addressed_only',
+      isGroupMessageAllowed: () => true,
+      messages: [
+        msg({
+          id: '1',
+          content: '사람에게 답장',
+          reply_to_message_content: '숨겨야 할 인용',
+          reply_to_sender_name: 'Alice',
+          reply_to_is_bot: false,
+        }),
+        msg({ id: '2', content: '@Andy 지금 질문' }),
+      ],
+    });
+
+    expect(selected.latestMessage?.id).toBe('2');
+    expect(selected.recentMessages).toHaveLength(0);
   });
 
   it('invokes registered DMs without mention and keeps only current message', () => {

@@ -54,6 +54,7 @@ vi.mock('grammy', () => ({
       sendMessage: vi.fn().mockResolvedValue(undefined),
       sendChatAction: vi.fn().mockResolvedValue(undefined),
       getFile: vi.fn().mockResolvedValue({ file_path: 'photos/file_0.jpg' }),
+      getChat: vi.fn().mockResolvedValue({ is_forum: false }),
     };
 
     constructor(token: string) {
@@ -95,6 +96,14 @@ vi.mock('undici', () => ({
 
 import fs from 'fs';
 import { TelegramChannel, TelegramChannelOpts } from './telegram.js';
+import { logger } from '../logger.js';
+import {
+  _closeDatabase,
+  _initTestDatabase,
+  getMessagesSince,
+  storeChatMetadata,
+  storeMessage,
+} from '../db.js';
 
 // --- Test helpers ---
 
@@ -120,6 +129,7 @@ function createTextCtx(overrides: {
   chatId?: number;
   chatType?: string;
   chatTitle?: string;
+  isForum?: boolean;
   text: string;
   fromId?: number;
   firstName?: string;
@@ -129,6 +139,7 @@ function createTextCtx(overrides: {
   entities?: any[];
   reply_to_message?: any;
   message_thread_id?: number;
+  me?: { id?: number; username?: string };
 }) {
   const chatId = overrides.chatId ?? 100200300;
   const chatType = overrides.chatType ?? 'group';
@@ -137,6 +148,9 @@ function createTextCtx(overrides: {
       id: chatId,
       type: chatType,
       title: overrides.chatTitle ?? 'Test Group',
+      ...(overrides.isForum === undefined
+        ? {}
+        : { is_forum: overrides.isForum }),
     },
     from: {
       id: overrides.fromId ?? 99001,
@@ -151,7 +165,7 @@ function createTextCtx(overrides: {
       reply_to_message: overrides.reply_to_message,
       message_thread_id: overrides.message_thread_id,
     },
-    me: { id: 12345, username: 'andy_ai_bot' },
+    me: overrides.me ?? { id: 12345, username: 'andy_ai_bot' },
     reply: vi.fn(),
   };
 }
@@ -159,11 +173,16 @@ function createTextCtx(overrides: {
 function createMediaCtx(overrides: {
   chatId?: number;
   chatType?: string;
+  chatTitle?: string;
+  isForum?: boolean;
   fromId?: number;
   firstName?: string;
   date?: number;
   messageId?: number;
   caption?: string;
+  message_thread_id?: number;
+  reply_to_message?: any;
+  me?: { id?: number; username?: string };
   extra?: Record<string, any>;
 }) {
   const chatId = overrides.chatId ?? 100200300;
@@ -171,7 +190,10 @@ function createMediaCtx(overrides: {
     chat: {
       id: chatId,
       type: overrides.chatType ?? 'group',
-      title: 'Test Group',
+      title: overrides.chatTitle ?? 'Test Group',
+      ...(overrides.isForum === undefined
+        ? {}
+        : { is_forum: overrides.isForum }),
     },
     from: {
       id: overrides.fromId ?? 99001,
@@ -182,9 +204,11 @@ function createMediaCtx(overrides: {
       date: overrides.date ?? Math.floor(Date.now() / 1000),
       message_id: overrides.messageId ?? 1,
       caption: overrides.caption,
+      message_thread_id: overrides.message_thread_id,
+      reply_to_message: overrides.reply_to_message,
       ...(overrides.extra || {}),
     },
-    me: { id: 12345, username: 'andy_ai_bot' },
+    me: overrides.me ?? { id: 12345, username: 'andy_ai_bot' },
   };
 }
 
@@ -234,6 +258,7 @@ describe('TelegramChannel', () => {
   });
 
   afterEach(() => {
+    vi.useRealTimers();
     vi.restoreAllMocks();
     vi.unstubAllGlobals();
   });
@@ -355,44 +380,527 @@ describe('TelegramChannel', () => {
       expect(opts.onMessage).not.toHaveBeenCalled();
     });
 
-    it('ignores forum topic messages until thread-aware routing is implemented', async () => {
+    it('delivers regular group thread messages instead of dropping them', async () => {
       const opts = createTestOpts();
       const channel = new TelegramChannel('test-token', opts);
       await channel.connect();
 
       const ctx = createTextCtx({
-        text: 'Topic-scoped message',
+        text: 'Thread reply',
         message_thread_id: 42,
       });
       await triggerTextMessage(ctx);
 
-      expect(opts.onChatMetadata).toHaveBeenCalledWith(
+      expect(opts.onMessage).toHaveBeenCalledWith(
         'tg:100200300',
-        expect.any(String),
-        'Test Group',
-        'telegram',
-        true,
+        expect.objectContaining({
+          chat_jid: 'tg:100200300',
+          content: 'Thread reply',
+        }),
       );
+    });
+
+    it('delivers confirmed non-forum supergroup thread messages', async () => {
+      const opts = createTestOpts();
+      const channel = new TelegramChannel('test-token', opts);
+      await channel.connect();
+
+      const ctx = createTextCtx({
+        chatType: 'supergroup',
+        isForum: false,
+        text: 'Non-forum supergroup reply',
+        message_thread_id: 42,
+      });
+      await triggerTextMessage(ctx);
+
+      expect(opts.onMessage).toHaveBeenCalledWith(
+        'tg:100200300',
+        expect.objectContaining({
+          chat_jid: 'tg:100200300',
+          content: 'Non-forum supergroup reply',
+        }),
+      );
+      expect(currentBot().api.getChat).not.toHaveBeenCalled();
+    });
+
+    it('rejects confirmed forum topic text messages in Phase 1', async () => {
+      const opts = createTestOpts();
+      const channel = new TelegramChannel('test-token', opts);
+      await channel.connect();
+
+      const ctx = createTextCtx({
+        chatType: 'supergroup',
+        isForum: true,
+        text: 'Forum topic text',
+        message_thread_id: 42,
+      });
+      await triggerTextMessage(ctx);
+
+      expect(opts.onMessage).not.toHaveBeenCalled();
+      expect(logger.warn).toHaveBeenCalledWith(
+        expect.objectContaining({
+          chatJid: 'tg:100200300',
+          threadId: 42,
+          reason: 'forum_topic_unsupported',
+        }),
+        expect.any(String),
+      );
+    });
+
+    it('ignores inbound text forum service updates without getChat or delivery', async () => {
+      const opts = createTestOpts();
+      const channel = new TelegramChannel('test-token', opts);
+      await channel.connect();
+
+      const ctx = createTextCtx({
+        chatType: 'supergroup',
+        text: '',
+        message_thread_id: 42,
+      });
+      (ctx.message as any).forum_topic_created = {};
+      await triggerTextMessage(ctx);
+
+      expect(currentBot().api.getChat).not.toHaveBeenCalled();
+      expect(opts.onMessage).not.toHaveBeenCalled();
+      expect(logger.warn).toHaveBeenCalledWith(
+        expect.objectContaining({
+          chatJid: 'tg:100200300',
+          messageId: '1',
+          threadId: 42,
+          reason: 'forum_service_message',
+        }),
+        'Telegram service message ignored',
+      );
+    });
+
+    it('rejects confirmed forum General topic text messages in Phase 1', async () => {
+      const opts = createTestOpts();
+      const channel = new TelegramChannel('test-token', opts);
+      await channel.connect();
+
+      const ctx = createTextCtx({
+        chatType: 'supergroup',
+        isForum: true,
+        text: 'Forum General topic text',
+      });
+      await triggerTextMessage(ctx);
+
+      expect(opts.onMessage).not.toHaveBeenCalled();
+      expect(logger.warn).toHaveBeenCalledWith(
+        expect.objectContaining({
+          chatJid: 'tg:100200300',
+          reason: 'forum_topic_unsupported',
+        }),
+        'Telegram forum message ignored',
+      );
+    });
+
+    it('uses getChat to reject missing-status supergroup messages without thread id when they are forum General topic traffic', async () => {
+      const opts = createTestOpts();
+      const channel = new TelegramChannel('test-token', opts);
+      await channel.connect();
+
+      currentBot().api.getChat.mockResolvedValueOnce({ is_forum: true });
+      const ctx = createTextCtx({
+        chatType: 'supergroup',
+        text: 'Forum General topic without inline status',
+      });
+      await triggerTextMessage(ctx);
+
+      expect(currentBot().api.getChat).toHaveBeenCalledWith(100200300);
+      expect(opts.onMessage).not.toHaveBeenCalled();
+      expect(logger.warn).toHaveBeenCalledWith(
+        expect.objectContaining({
+          chatJid: 'tg:100200300',
+          threadId: undefined,
+          reason: 'forum_topic_unsupported',
+        }),
+        'Telegram forum message ignored',
+      );
+    });
+
+    it('delivers missing-status supergroup messages without thread id when getChat omits optional is_forum', async () => {
+      const opts = createTestOpts();
+      const channel = new TelegramChannel('test-token', opts);
+      await channel.connect();
+
+      currentBot().api.getChat.mockResolvedValueOnce({
+        id: 100200300,
+        type: 'supergroup',
+        title: 'Test Group',
+      });
+      const ctx = createTextCtx({
+        chatType: 'supergroup',
+        text: 'Normal supergroup message without inline status',
+      });
+      await triggerTextMessage(ctx);
+
+      expect(currentBot().api.getChat).toHaveBeenCalledWith(100200300);
+      expect(opts.onMessage).toHaveBeenCalledWith(
+        'tg:100200300',
+        expect.objectContaining({
+          chat_jid: 'tg:100200300',
+          content: 'Normal supergroup message without inline status',
+        }),
+      );
+      expect(logger.debug).toHaveBeenCalledWith(
+        expect.objectContaining({
+          reason: 'forum_status_missing_treated_as_non_forum',
+          threadId: undefined,
+          deliverable: true,
+        }),
+        'Telegram forum status lookup treated as non-forum',
+      );
+    });
+
+    it('uses getChat to confirm missing-status supergroup threads before delivering', async () => {
+      const opts = createTestOpts();
+      const channel = new TelegramChannel('test-token', opts);
+      await channel.connect();
+
+      currentBot().api.getChat.mockResolvedValueOnce({ is_forum: false });
+      const ctx = createTextCtx({
+        chatType: 'supergroup',
+        text: 'Missing status but non-forum',
+        message_thread_id: 42,
+      });
+      await triggerTextMessage(ctx);
+
+      expect(currentBot().api.getChat).toHaveBeenCalledWith(100200300);
+      expect(opts.onMessage).toHaveBeenCalledWith(
+        'tg:100200300',
+        expect.objectContaining({
+          chat_jid: 'tg:100200300',
+          content: 'Missing status but non-forum',
+        }),
+      );
+    });
+
+    it('rejects missing-status supergroup threads when getChat confirms forum', async () => {
+      const opts = createTestOpts();
+      const channel = new TelegramChannel('test-token', opts);
+      await channel.connect();
+
+      currentBot().api.getChat.mockResolvedValueOnce({ is_forum: true });
+      const ctx = createTextCtx({
+        chatType: 'supergroup',
+        text: 'Actually forum',
+        message_thread_id: 42,
+      });
+      await triggerTextMessage(ctx);
+
+      expect(opts.onMessage).not.toHaveBeenCalled();
+      expect(logger.warn).toHaveBeenCalledWith(
+        expect.objectContaining({
+          reason: 'forum_topic_unsupported',
+        }),
+        expect.any(String),
+      );
+    });
+
+    it('delivers missing-status supergroup threads when getChat fails', async () => {
+      const opts = createTestOpts();
+      const channel = new TelegramChannel('test-token', opts);
+      await channel.connect();
+
+      currentBot().api.getChat.mockRejectedValueOnce(new Error('network down'));
+      const ctx = createTextCtx({
+        chatType: 'supergroup',
+        text: 'Do not leak me',
+        reply_to_message: {
+          message_id: 88,
+          text: 'Do not log quoted text',
+          from: { id: 12345, first_name: 'Andy' },
+        },
+        message_thread_id: 42,
+      });
+      await triggerTextMessage(ctx);
+
+      expect(opts.onMessage).toHaveBeenCalledWith(
+        'tg:100200300',
+        expect.objectContaining({
+          chat_jid: 'tg:100200300',
+          content: 'Do not leak me',
+        }),
+      );
+      for (const [logData] of vi.mocked(logger.debug).mock.calls) {
+        const serialized = JSON.stringify(logData);
+        expect(serialized).not.toContain('Do not leak me');
+        expect(serialized).not.toContain('Do not log quoted text');
+        expect(serialized).not.toContain('reply_to_message_content');
+        expect(serialized).not.toContain('replyToContent');
+        expect(serialized).not.toContain('caption');
+      }
+      expect(logger.debug).toHaveBeenCalledWith(
+        expect.objectContaining({
+          reason: 'forum_status_lookup_failed_treated_as_non_forum',
+          chatJid: 'tg:100200300',
+          messageId: '1',
+          threadId: 42,
+          deliverable: true,
+        }),
+        'Telegram forum status lookup treated as non-forum',
+      );
+      expect(logger.warn).not.toHaveBeenCalledWith(
+        expect.objectContaining({ reason: 'forum_status_lookup_failed' }),
+        'Telegram forum message ignored',
+      );
+    });
+
+    it('delivers missing-status supergroup threads when getChat is unavailable', async () => {
+      const opts = createTestOpts();
+      const channel = new TelegramChannel('test-token', opts);
+      await channel.connect();
+
+      (currentBot().api as { getChat?: unknown }).getChat = undefined;
+      const ctx = createTextCtx({
+        chatType: 'supergroup',
+        text: 'No getChat support',
+        message_thread_id: 42,
+      });
+      await triggerTextMessage(ctx);
+
+      expect(opts.onMessage).toHaveBeenCalledWith(
+        'tg:100200300',
+        expect.objectContaining({
+          chat_jid: 'tg:100200300',
+          content: 'No getChat support',
+        }),
+      );
+      expect(logger.debug).toHaveBeenCalledWith(
+        expect.objectContaining({
+          reason: 'forum_status_lookup_unavailable_treated_as_non_forum',
+          threadId: 42,
+          deliverable: true,
+        }),
+        'Telegram forum status lookup treated as non-forum',
+      );
+    });
+
+    it('delivers missing-status supergroup threads when getChat is rate limited', async () => {
+      const opts = createTestOpts();
+      const channel = new TelegramChannel('test-token', opts);
+      await channel.connect();
+
+      currentBot().api.getChat.mockRejectedValueOnce({ error_code: 429 });
+      const ctx = createTextCtx({
+        chatType: 'supergroup',
+        text: 'Rate limited',
+        message_thread_id: 42,
+      });
+      await triggerTextMessage(ctx);
+
+      expect(opts.onMessage).toHaveBeenCalledWith(
+        'tg:100200300',
+        expect.objectContaining({
+          chat_jid: 'tg:100200300',
+          content: 'Rate limited',
+        }),
+      );
+      expect(logger.debug).toHaveBeenCalledWith(
+        expect.objectContaining({
+          reason: 'forum_status_lookup_rate_limited_treated_as_non_forum',
+          deliverable: true,
+        }),
+        'Telegram forum status lookup treated as non-forum',
+      );
+    });
+
+    it('delivers missing-status supergroup threads when getChat times out', async () => {
+      vi.useFakeTimers();
+      const opts = createTestOpts();
+      const channel = new TelegramChannel('test-token', opts);
+      await channel.connect();
+
+      currentBot().api.getChat.mockImplementationOnce(
+        () => new Promise(() => {}),
+      );
+      const ctx = createTextCtx({
+        chatType: 'supergroup',
+        text: 'Timeout',
+        message_thread_id: 42,
+      });
+      const pending = triggerTextMessage(ctx);
+
+      await vi.advanceTimersByTimeAsync(1501);
+      await pending;
+
+      expect(opts.onMessage).toHaveBeenCalledWith(
+        'tg:100200300',
+        expect.objectContaining({
+          chat_jid: 'tg:100200300',
+          content: 'Timeout',
+        }),
+      );
+      expect(logger.debug).toHaveBeenCalledWith(
+        expect.objectContaining({
+          reason: 'forum_status_lookup_timeout_treated_as_non_forum',
+          deliverable: true,
+        }),
+        'Telegram forum status lookup treated as non-forum',
+      );
+    });
+
+    it('does not call getChat for unregistered ambiguous thread messages', async () => {
+      const opts = createTestOpts({
+        registeredGroups: vi.fn(() => ({})),
+      });
+      const channel = new TelegramChannel('test-token', opts);
+      await channel.connect();
+
+      const ctx = createTextCtx({
+        chatType: 'supergroup',
+        text: 'Unknown chat',
+        message_thread_id: 42,
+      });
+      await triggerTextMessage(ctx);
+
+      expect(opts.onChatMetadata).toHaveBeenCalled();
+      expect(currentBot().api.getChat).not.toHaveBeenCalled();
       expect(opts.onMessage).not.toHaveBeenCalled();
     });
 
-    it('skips bot commands (/chatid, /ping) but passes other / messages through', async () => {
+    it('delivers reply-to-bot in a regular group thread', async () => {
+      const opts = createTestOpts();
+      const channel = new TelegramChannel('test-token', opts);
+      await channel.connect();
+
+      const ctx = createTextCtx({
+        text: '이어서 설명해줘',
+        message_thread_id: 42,
+        reply_to_message: {
+          message_id: 77,
+          text: 'Bot answer',
+          from: { id: 12345, first_name: 'Andy' },
+        },
+      });
+      await triggerTextMessage(ctx);
+
+      expect(opts.onMessage).toHaveBeenCalledWith(
+        'tg:100200300',
+        expect.objectContaining({
+          reply_to_message_id: '77',
+          reply_to_message_content: 'Bot answer',
+          reply_to_sender_name: 'Andy',
+          reply_to_is_bot: true,
+        }),
+      );
+    });
+
+    it('delivers reply-to-human in a regular group thread without implicit addressing', async () => {
+      const opts = createTestOpts();
+      const channel = new TelegramChannel('test-token', opts);
+      await channel.connect();
+
+      const ctx = createTextCtx({
+        text: '사람에게 답장',
+        message_thread_id: 42,
+        reply_to_message: {
+          message_id: 78,
+          text: 'Human note',
+          from: { id: 777, first_name: 'Bob' },
+        },
+      });
+      await triggerTextMessage(ctx);
+
+      expect(opts.onMessage).toHaveBeenCalledWith(
+        'tg:100200300',
+        expect.objectContaining({
+          reply_to_message_id: '78',
+          reply_to_message_content: 'Human note',
+          reply_to_sender_name: 'Bob',
+          reply_to_is_bot: false,
+        }),
+      );
+    });
+
+    it('does not emit the old forum-topic warning for regular group replies', async () => {
+      const opts = createTestOpts();
+      const channel = new TelegramChannel('test-token', opts);
+      await channel.connect();
+
+      const ctx = createTextCtx({
+        text: 'Thread reply',
+        message_thread_id: 42,
+      });
+      await triggerTextMessage(ctx);
+
+      expect(logger.warn).not.toHaveBeenCalledWith(
+        expect.anything(),
+        'Telegram forum topics are not supported yet; ignoring topic message',
+      );
+    });
+
+    it('stores adapter-delivered missing-status supergroup reply-to-bot messages in SQLite', async () => {
+      _initTestDatabase();
+      try {
+        const opts = createTestOpts({
+          onMessage: vi.fn((_chatJid, message) => storeMessage(message)),
+          onChatMetadata: vi.fn((chatJid, timestamp, name, channel, isGroup) =>
+            storeChatMetadata(chatJid, timestamp, name, channel, isGroup),
+          ),
+        });
+        const channel = new TelegramChannel('test-token', opts);
+        await channel.connect();
+
+        currentBot().api.getChat.mockResolvedValueOnce({
+          id: 100200300,
+          type: 'supergroup',
+          title: '루나방',
+        });
+        const ctx = createTextCtx({
+          chatType: 'supergroup',
+          text: '이어서 설명해줘',
+          message_thread_id: 42,
+          reply_to_message: {
+            message_id: 77,
+            text: 'Bot answer',
+            from: { id: 12345, first_name: 'Andy' },
+          },
+        });
+        await triggerTextMessage(ctx);
+
+        const messages = getMessagesSince(
+          'tg:100200300',
+          '2024-01-01T00:00:00.000Z',
+          'Andy',
+        );
+        expect(messages).toHaveLength(1);
+        expect(messages[0]).toMatchObject({
+          id: '1',
+          chat_jid: 'tg:100200300',
+          content: '이어서 설명해줘',
+          reply_to_message_id: '77',
+          reply_to_message_content: 'Bot answer',
+          reply_to_sender_name: 'Andy',
+          reply_to_is_bot: true,
+        });
+        expect(messages[0].chat_jid).not.toContain('thread');
+      } finally {
+        _closeDatabase();
+      }
+    });
+
+    it('skips bot commands (/chatid, /ping) but passes other / messages through when thread id is present', async () => {
       const opts = createTestOpts();
       const channel = new TelegramChannel('test-token', opts);
       await channel.connect();
 
       // Bot commands should be skipped
-      const ctx1 = createTextCtx({ text: '/chatid' });
+      const ctx1 = createTextCtx({ text: '/chatid', message_thread_id: 42 });
       await triggerTextMessage(ctx1);
       expect(opts.onMessage).not.toHaveBeenCalled();
       expect(opts.onChatMetadata).not.toHaveBeenCalled();
 
-      const ctx2 = createTextCtx({ text: '/ping' });
+      const ctx2 = createTextCtx({ text: '/ping', message_thread_id: 42 });
       await triggerTextMessage(ctx2);
       expect(opts.onMessage).not.toHaveBeenCalled();
 
       // Non-bot /commands should flow through
-      const ctx3 = createTextCtx({ text: '/remote-control' });
+      const ctx3 = createTextCtx({
+        text: '/remote-control',
+        message_thread_id: 42,
+      });
       await triggerTextMessage(ctx3);
       expect(opts.onMessage).toHaveBeenCalledTimes(1);
       expect(opts.onMessage).toHaveBeenCalledWith(
@@ -526,6 +1034,7 @@ describe('TelegramChannel', () => {
       const ctx = createTextCtx({
         text: '@andy_ai_bot what time is it?',
         entities: [{ type: 'mention', offset: 0, length: 12 }],
+        message_thread_id: 42,
       });
       await triggerTextMessage(ctx);
 
@@ -726,20 +1235,467 @@ describe('TelegramChannel', () => {
       const ctx = createTextCtx({ text: 'Just a normal message' });
       await triggerTextMessage(ctx);
 
-      expect(opts.onMessage).toHaveBeenCalledWith(
-        'tg:100200300',
-        expect.objectContaining({
-          reply_to_message_id: undefined,
-          reply_to_message_content: undefined,
-          reply_to_sender_name: undefined,
-        }),
-      );
+      const delivered = vi.mocked(opts.onMessage).mock.calls[0]?.[1];
+      expect(delivered).not.toHaveProperty('reply_to_message_id');
+      expect(delivered).not.toHaveProperty('reply_to_message_content');
+      expect(delivered).not.toHaveProperty('reply_to_sender_name');
+      expect(delivered).not.toHaveProperty('reply_to_is_bot');
     });
   });
 
   // --- Non-text messages ---
 
   describe('non-text messages', () => {
+    it('delivers media messages in regular group reply threads', async () => {
+      const opts = createTestOpts();
+      const channel = new TelegramChannel('test-token', opts);
+      await channel.connect();
+
+      const ctx = createMediaCtx({ message_thread_id: 42 });
+      await triggerMediaMessage('message:location', ctx);
+
+      expect(opts.onMessage).toHaveBeenCalledWith(
+        'tg:100200300',
+        expect.objectContaining({
+          chat_jid: 'tg:100200300',
+          content: '[Location]',
+        }),
+      );
+    });
+
+    it('preserves reply_to_bot metadata for media replies', async () => {
+      const opts = createTestOpts();
+      const channel = new TelegramChannel('test-token', opts);
+      await channel.connect();
+
+      const ctx = createMediaCtx({
+        message_thread_id: 42,
+        reply_to_message: {
+          message_id: 77,
+          text: 'Bot answer',
+          from: { id: 12345, first_name: 'Andy' },
+        },
+      });
+      await triggerMediaMessage('message:location', ctx);
+
+      expect(opts.onMessage).toHaveBeenCalledWith(
+        'tg:100200300',
+        expect.objectContaining({
+          reply_to_message_id: '77',
+          reply_to_message_content: 'Bot answer',
+          reply_to_sender_name: 'Andy',
+          reply_to_is_bot: true,
+        }),
+      );
+    });
+
+    it('preserves reply_to_human metadata for media replies without addressing', async () => {
+      const opts = createTestOpts();
+      const channel = new TelegramChannel('test-token', opts);
+      await channel.connect();
+
+      const ctx = createMediaCtx({
+        message_thread_id: 42,
+        reply_to_message: {
+          message_id: 78,
+          caption: 'Human photo',
+          from: { id: 777, first_name: 'Bob' },
+        },
+      });
+      await triggerMediaMessage('message:contact', ctx);
+
+      expect(opts.onMessage).toHaveBeenCalledWith(
+        'tg:100200300',
+        expect.objectContaining({
+          reply_to_message_id: '78',
+          reply_to_message_content: 'Human photo',
+          reply_to_sender_name: 'Bob',
+          reply_to_is_bot: false,
+        }),
+      );
+    });
+
+    it('does not mark quoted forum service messages as reply_to_bot for media', async () => {
+      const opts = createTestOpts();
+      const channel = new TelegramChannel('test-token', opts);
+      await channel.connect();
+
+      const ctx = createMediaCtx({
+        message_thread_id: 42,
+        reply_to_message: {
+          message_id: 79,
+          from: { id: 12345, first_name: 'Andy' },
+          forum_topic_created: {},
+        },
+      });
+      await triggerMediaMessage('message:location', ctx);
+
+      expect(opts.onMessage).toHaveBeenCalledWith(
+        'tg:100200300',
+        expect.objectContaining({
+          reply_to_message_id: '79',
+          reply_to_sender_name: 'Andy',
+          reply_to_is_bot: false,
+        }),
+      );
+    });
+
+    it('preserves media reply metadata when bot id is unavailable', async () => {
+      const opts = createTestOpts();
+      const channel = new TelegramChannel('test-token', opts);
+      await channel.connect();
+
+      const ctx = createMediaCtx({
+        message_thread_id: 42,
+        me: { username: 'andy_ai_bot' },
+        reply_to_message: {
+          message_id: 80,
+          text: 'Maybe bot',
+          from: { id: 12345, first_name: 'Andy' },
+        },
+      });
+      await triggerMediaMessage('message:location', ctx);
+
+      expect(opts.onMessage).toHaveBeenCalledWith(
+        'tg:100200300',
+        expect.objectContaining({
+          reply_to_message_id: '80',
+          reply_to_message_content: 'Maybe bot',
+          reply_to_is_bot: false,
+        }),
+      );
+    });
+
+    it('does not deliver media forum topic messages in Phase 1', async () => {
+      const opts = createTestOpts();
+      const channel = new TelegramChannel('test-token', opts);
+      await channel.connect();
+
+      const ctx = createMediaCtx({
+        chatType: 'supergroup',
+        isForum: true,
+        message_thread_id: 42,
+      });
+      await triggerMediaMessage('message:location', ctx);
+
+      expect(opts.onMessage).not.toHaveBeenCalled();
+      expect(logger.warn).toHaveBeenCalledWith(
+        expect.objectContaining({
+          reason: 'forum_topic_unsupported',
+          threadId: 42,
+        }),
+        expect.any(String),
+      );
+    });
+
+    it('ignores inbound media forum service updates without getChat or delivery', async () => {
+      const opts = createTestOpts();
+      const channel = new TelegramChannel('test-token', opts);
+      await channel.connect();
+
+      const ctx = createMediaCtx({
+        chatType: 'supergroup',
+        message_thread_id: 42,
+        extra: { forum_topic_created: {} },
+      });
+      await triggerMediaMessage('message:location', ctx);
+
+      expect(currentBot().api.getChat).not.toHaveBeenCalled();
+      expect(opts.onMessage).not.toHaveBeenCalled();
+      expect(logger.warn).toHaveBeenCalledWith(
+        expect.objectContaining({
+          chatJid: 'tg:100200300',
+          messageId: '1',
+          threadId: 42,
+          reason: 'forum_service_message',
+        }),
+        'Telegram service message ignored',
+      );
+    });
+
+    it('does not deliver media forum General topic messages in Phase 1', async () => {
+      const opts = createTestOpts();
+      const channel = new TelegramChannel('test-token', opts);
+      await channel.connect();
+
+      const ctx = createMediaCtx({
+        chatType: 'supergroup',
+        isForum: true,
+      });
+      await triggerMediaMessage('message:location', ctx);
+
+      expect(opts.onMessage).not.toHaveBeenCalled();
+      expect(logger.warn).toHaveBeenCalledWith(
+        expect.objectContaining({
+          reason: 'forum_topic_unsupported',
+          chatJid: 'tg:100200300',
+        }),
+        'Telegram forum media ignored',
+      );
+    });
+
+    it('uses getChat to reject missing-status media messages without thread id when they are forum General topic traffic', async () => {
+      const opts = createTestOpts();
+      const channel = new TelegramChannel('test-token', opts);
+      await channel.connect();
+
+      currentBot().api.getChat.mockResolvedValueOnce({ is_forum: true });
+      const ctx = createMediaCtx({
+        chatType: 'supergroup',
+      });
+      await triggerMediaMessage('message:location', ctx);
+
+      expect(currentBot().api.getChat).toHaveBeenCalledWith(100200300);
+      expect(opts.onMessage).not.toHaveBeenCalled();
+      expect(logger.warn).toHaveBeenCalledWith(
+        expect.objectContaining({
+          reason: 'forum_topic_unsupported',
+          threadId: undefined,
+          chatJid: 'tg:100200300',
+        }),
+        'Telegram forum media ignored',
+      );
+    });
+
+    it('delivers media when missing-status supergroup getChat omits optional is_forum', async () => {
+      const opts = createTestOpts();
+      const channel = new TelegramChannel('test-token', opts);
+      await channel.connect();
+
+      currentBot().api.getChat.mockResolvedValueOnce({
+        id: 100200300,
+        type: 'supergroup',
+        title: '루나방',
+      });
+      const ctx = createMediaCtx({
+        chatType: 'supergroup',
+        message_thread_id: 42,
+        reply_to_message: {
+          message_id: 77,
+          text: 'Bot answer',
+          from: { id: 12345, first_name: 'Andy' },
+        },
+      });
+      await triggerMediaMessage('message:location', ctx);
+
+      expect(opts.onMessage).toHaveBeenCalledWith(
+        'tg:100200300',
+        expect.objectContaining({
+          chat_jid: 'tg:100200300',
+          content: '[Location]',
+          reply_to_message_id: '77',
+          reply_to_is_bot: true,
+        }),
+      );
+      expect(logger.debug).toHaveBeenCalledWith(
+        expect.objectContaining({
+          reason: 'forum_status_missing_treated_as_non_forum',
+          deliverable: true,
+          threadId: 42,
+        }),
+        'Telegram forum status lookup treated as non-forum',
+      );
+    });
+
+    it('delivers media after missing-status thread lookup fails', async () => {
+      const opts = createTestOpts();
+      const channel = new TelegramChannel('test-token', opts);
+      await channel.connect();
+
+      currentBot().api.getChat.mockRejectedValueOnce(new Error('network down'));
+      const ctx = createMediaCtx({
+        chatType: 'supergroup',
+        message_thread_id: 42,
+        caption: 'Do not log caption',
+        extra: { photo: [{ file_id: 'photo_id', width: 800 }] },
+      });
+      await triggerMediaMessage('message:photo', ctx);
+      await flushPromises();
+
+      expect(currentBot().api.getFile).toHaveBeenCalledWith('photo_id');
+      expect(opts.onMessage).toHaveBeenCalledWith(
+        'tg:100200300',
+        expect.objectContaining({
+          chat_jid: 'tg:100200300',
+          content:
+            '[Photo] (/workspace/group/attachments/photo_1.jpg) Do not log caption',
+        }),
+      );
+      expect(logger.debug).toHaveBeenCalledWith(
+        expect.objectContaining({
+          reason: 'forum_status_lookup_failed_treated_as_non_forum',
+          threadId: 42,
+          deliverable: true,
+        }),
+        'Telegram forum status lookup treated as non-forum',
+      );
+      for (const [logData] of vi.mocked(logger.debug).mock.calls) {
+        const serialized = JSON.stringify(logData);
+        expect(serialized).not.toContain('Do not log caption');
+        expect(serialized).not.toContain('caption');
+        expect(serialized).not.toContain('photo_id');
+        expect(serialized).not.toContain('reply_to_message_content');
+      }
+    });
+
+    it('delivers media after missing-status thread lookup is rate limited', async () => {
+      const opts = createTestOpts();
+      const channel = new TelegramChannel('test-token', opts);
+      await channel.connect();
+
+      currentBot().api.getChat.mockRejectedValueOnce({ error_code: 429 });
+      const ctx = createMediaCtx({
+        chatType: 'supergroup',
+        message_thread_id: 42,
+        extra: { photo: [{ file_id: 'photo_id', width: 800 }] },
+      });
+      await triggerMediaMessage('message:photo', ctx);
+      await flushPromises();
+
+      expect(currentBot().api.getFile).toHaveBeenCalledWith('photo_id');
+      expect(opts.onMessage).toHaveBeenCalledWith(
+        'tg:100200300',
+        expect.objectContaining({
+          chat_jid: 'tg:100200300',
+        }),
+      );
+      expect(logger.debug).toHaveBeenCalledWith(
+        expect.objectContaining({
+          reason: 'forum_status_lookup_rate_limited_treated_as_non_forum',
+          threadId: 42,
+          deliverable: true,
+        }),
+        'Telegram forum status lookup treated as non-forum',
+      );
+    });
+
+    it('delivers media after missing-status thread lookup is unavailable', async () => {
+      const opts = createTestOpts();
+      const channel = new TelegramChannel('test-token', opts);
+      await channel.connect();
+
+      (currentBot().api as { getChat?: unknown }).getChat = undefined;
+      const ctx = createMediaCtx({
+        chatType: 'supergroup',
+        message_thread_id: 42,
+      });
+      await triggerMediaMessage('message:location', ctx);
+
+      expect(opts.onMessage).toHaveBeenCalledWith(
+        'tg:100200300',
+        expect.objectContaining({
+          chat_jid: 'tg:100200300',
+          content: '[Location]',
+        }),
+      );
+      expect(logger.debug).toHaveBeenCalledWith(
+        expect.objectContaining({
+          reason: 'forum_status_lookup_unavailable_treated_as_non_forum',
+          threadId: 42,
+          deliverable: true,
+        }),
+        'Telegram forum status lookup treated as non-forum',
+      );
+    });
+
+    it('delivers media after missing-status thread lookup times out', async () => {
+      vi.useFakeTimers();
+      const opts = createTestOpts();
+      const channel = new TelegramChannel('test-token', opts);
+      await channel.connect();
+
+      currentBot().api.getChat.mockImplementationOnce(
+        () => new Promise(() => {}),
+      );
+      const ctx = createMediaCtx({
+        chatType: 'supergroup',
+        message_thread_id: 42,
+      });
+      const pending = triggerMediaMessage('message:location', ctx);
+
+      await vi.advanceTimersByTimeAsync(1501);
+      await pending;
+
+      expect(opts.onMessage).toHaveBeenCalledWith(
+        'tg:100200300',
+        expect.objectContaining({
+          chat_jid: 'tg:100200300',
+          content: '[Location]',
+        }),
+      );
+      expect(logger.debug).toHaveBeenCalledWith(
+        expect.objectContaining({
+          reason: 'forum_status_lookup_timeout_treated_as_non_forum',
+          threadId: 42,
+          deliverable: true,
+        }),
+        'Telegram forum status lookup treated as non-forum',
+      );
+    });
+
+    it('falls back to a media placeholder when Telegram getFile hangs', async () => {
+      vi.useFakeTimers();
+      const opts = createTestOpts();
+      const channel = new TelegramChannel('test-token', opts);
+      await channel.connect();
+
+      currentBot().api.getFile.mockImplementationOnce(
+        () => new Promise(() => {}),
+      );
+      const ctx = createMediaCtx({
+        extra: {
+          photo: [{ file_id: 'photo_id', width: 800 }],
+        },
+      });
+      const pending = triggerMediaMessage('message:photo', ctx);
+
+      await vi.advanceTimersByTimeAsync(30_001);
+      await pending;
+
+      expect(opts.onMessage).toHaveBeenCalledWith(
+        'tg:100200300',
+        expect.objectContaining({
+          content: '[Photo]',
+        }),
+      );
+      expect(logger.warn).toHaveBeenCalledWith(
+        expect.objectContaining({ fileId: 'photo_id' }),
+        'Telegram getFile timed out',
+      );
+    });
+
+    it('falls back to a media placeholder when Telegram file body hangs', async () => {
+      vi.useFakeTimers();
+      const opts = createTestOpts();
+      const channel = new TelegramChannel('test-token', opts);
+      await channel.connect();
+
+      undiciFetchRef.current.mockResolvedValueOnce({
+        ok: true,
+        arrayBuffer: vi.fn(() => new Promise(() => {})),
+      });
+      const ctx = createMediaCtx({
+        extra: {
+          photo: [{ file_id: 'photo_id', width: 800 }],
+        },
+      });
+      const pending = triggerMediaMessage('message:photo', ctx);
+
+      await vi.advanceTimersByTimeAsync(30_001);
+      await pending;
+
+      expect(opts.onMessage).toHaveBeenCalledWith(
+        'tg:100200300',
+        expect.objectContaining({
+          content: '[Photo]',
+        }),
+      );
+      expect(logger.warn).toHaveBeenCalledWith(
+        expect.objectContaining({ fileId: 'photo_id' }),
+        'Telegram file body download timed out',
+      );
+    });
+
     it('downloads photo and includes path in content', async () => {
       const opts = createTestOpts();
       const channel = new TelegramChannel('test-token', opts);
@@ -994,6 +1950,13 @@ describe('TelegramChannel', () => {
   // --- sendMessage ---
 
   describe('sendMessage', () => {
+    function expectNoTelegramScopeParams(callIndex: number) {
+      const options = currentBot().api.sendMessage.mock.calls[callIndex]?.[2];
+      expect(options).not.toHaveProperty('reply_to_message_id');
+      expect(options).not.toHaveProperty('message_thread_id');
+      expect(options).not.toHaveProperty('allow_sending_without_reply');
+    }
+
     it('sends message via bot API', async () => {
       const opts = createTestOpts();
       const channel = new TelegramChannel('test-token', opts);
@@ -1004,8 +1967,18 @@ describe('TelegramChannel', () => {
       expect(currentBot().api.sendMessage).toHaveBeenCalledWith(
         '100200300',
         'Hello',
-        { parse_mode: 'Markdown' },
+        expect.not.objectContaining({
+          reply_to_message_id: expect.anything(),
+          message_thread_id: expect.anything(),
+          allow_sending_without_reply: expect.anything(),
+        }),
       );
+      expect(currentBot().api.sendMessage).toHaveBeenCalledWith(
+        '100200300',
+        'Hello',
+        expect.objectContaining({ parse_mode: 'Markdown' }),
+      );
+      expectNoTelegramScopeParams(0);
     });
 
     it('strips tg: prefix from JID', async () => {
@@ -1035,14 +2008,51 @@ describe('TelegramChannel', () => {
         1,
         '100200300',
         'x'.repeat(4096),
-        { parse_mode: 'Markdown' },
+        expect.not.objectContaining({
+          reply_to_message_id: expect.anything(),
+          message_thread_id: expect.anything(),
+          allow_sending_without_reply: expect.anything(),
+        }),
       );
       expect(currentBot().api.sendMessage).toHaveBeenNthCalledWith(
         2,
         '100200300',
         'x'.repeat(904),
-        { parse_mode: 'Markdown' },
+        expect.not.objectContaining({
+          reply_to_message_id: expect.anything(),
+          message_thread_id: expect.anything(),
+          allow_sending_without_reply: expect.anything(),
+        }),
       );
+      expectNoTelegramScopeParams(0);
+      expectNoTelegramScopeParams(1);
+    });
+
+    it('does not add reply or thread params to Markdown fallback sends', async () => {
+      const opts = createTestOpts();
+      const channel = new TelegramChannel('test-token', opts);
+      await channel.connect();
+
+      currentBot()
+        .api.sendMessage.mockRejectedValueOnce(
+          new Error('Markdown parse failed'),
+        )
+        .mockResolvedValueOnce(undefined);
+
+      await channel.sendMessage('tg:100200300', 'Fallback');
+
+      expect(currentBot().api.sendMessage).toHaveBeenNthCalledWith(
+        2,
+        '100200300',
+        'Fallback',
+        expect.not.objectContaining({
+          reply_to_message_id: expect.anything(),
+          message_thread_id: expect.anything(),
+          allow_sending_without_reply: expect.anything(),
+        }),
+      );
+      expectNoTelegramScopeParams(0);
+      expectNoTelegramScopeParams(1);
     });
 
     it('sends exactly one message at 4096 characters', async () => {

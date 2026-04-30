@@ -144,16 +144,22 @@ function platformLabel(platform: ChatPlatform): string {
   return platform === 'unknown' ? 'unknown messaging platform' : platform;
 }
 
-function renderMessage(message: ChatSurfaceMessage): string {
+function renderQuotedMessage(message: ChatSurfaceMessage): string {
+  return message.replyToMessageContent && message.replyToSenderName
+    ? `\n    <quoted_message sender="${escapeXml(message.replyToSenderName)}">${escapeXml(message.replyToMessageContent)}</quoted_message>`
+    : '';
+}
+
+function renderMessage(
+  message: ChatSurfaceMessage,
+  opts: { includeQuotedMessage: boolean },
+): string {
   const attrs = [
     `id="${escapeXml(message.id)}"`,
     `sender="${escapeXml(message.senderName || message.sender)}"`,
     `time="${escapeXml(message.timestamp)}"`,
   ];
-  const quoted =
-    message.replyToMessageContent && message.replyToSenderName
-      ? `\n    <quoted_message sender="${escapeXml(message.replyToSenderName)}">${escapeXml(message.replyToMessageContent)}</quoted_message>`
-      : '';
+  const quoted = opts.includeQuotedMessage ? renderQuotedMessage(message) : '';
   return `  <message ${attrs.join(' ')}>${quoted}\n    ${escapeXml(message.text)}\n  </message>`;
 }
 
@@ -167,7 +173,13 @@ export function buildChatSurfacePrompt(input: ChatSurfacePromptInput): string {
 
   const recentContext =
     input.recentMessages.length > 0
-      ? `<recent_context>\n${input.recentMessages.map(renderMessage).join('\n')}\n</recent_context>`
+      ? `<recent_context>\n${input.recentMessages
+          .map((message) =>
+            renderMessage(message, {
+              includeQuotedMessage: input.platform === 'telegram',
+            }),
+          )
+          .join('\n')}\n</recent_context>`
       : '<recent_context />';
 
   return `# Chat Surface Rules
@@ -203,7 +215,7 @@ ${recentContext}
 
 <latest_message id="${escapeXml(input.latestMessage.id)}" sender="${escapeXml(
     input.latestMessage.senderName || input.latestMessage.sender,
-  )}" time="${escapeXml(input.latestMessage.timestamp)}">
+  )}" time="${escapeXml(input.latestMessage.timestamp)}">${input.platform === 'telegram' ? renderQuotedMessage(input.latestMessage) : ''}
 ${escapeXml(latestText)}
 </latest_message>`;
 }

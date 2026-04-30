@@ -74,4 +74,58 @@ describe('chat surface mention properties', () => {
       { numRuns: Number(process.env.PROPERTY_RUNS || 50) },
     );
   });
+
+  it('reply-to-bot group messages are addressed without a textual trigger', () => {
+    fc.assert(
+      fc.property(unaddressedText, (body) => {
+        const selected = selectChatSurfaceMessages({
+          chatType: 'group',
+          trigger: '@Andy',
+          assistantAliases: [],
+          contextPolicy: 'addressed_only',
+          isGroupMessageAllowed: () => true,
+          messages: [
+            {
+              ...msg('1', body),
+              reply_to_message_id: 'bot-message',
+              reply_to_message_content: 'prior bot answer',
+              reply_to_sender_name: 'Andy',
+              reply_to_is_bot: true,
+            },
+          ],
+        });
+
+        expect(selected.latestMessage?.id).toBe('1');
+        expect(selected.addressedBy).toBe('reply_to_bot');
+      }),
+      { numRuns: Number(process.env.PROPERTY_RUNS || 50) },
+    );
+  });
+
+  it('reply-to-human group messages are not addressed without a textual trigger', () => {
+    fc.assert(
+      fc.property(unaddressedText, (body) => {
+        const selected = selectChatSurfaceMessages({
+          chatType: 'group',
+          trigger: '@Andy',
+          assistantAliases: [],
+          contextPolicy: 'addressed_only',
+          isGroupMessageAllowed: () => true,
+          messages: [
+            {
+              ...msg('1', body),
+              reply_to_message_id: 'human-message',
+              reply_to_message_content: 'human context',
+              reply_to_sender_name: 'Alice',
+              reply_to_is_bot: false,
+            },
+          ],
+        });
+
+        expect(selected.latestMessage).toBeNull();
+        expect(selected.addressedBy).toBeNull();
+      }),
+      { numRuns: Number(process.env.PROPERTY_RUNS || 50) },
+    );
+  });
 });

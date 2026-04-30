@@ -11,11 +11,18 @@ import { logger } from '../logger.js';
 import { createTelegramFetch } from './telegram-fetch.js';
 import { registerChannel, ChannelOpts } from './registry.js';
 import {
+  extractTelegramReplyMetadata,
+  isTelegramForumServiceMessage,
+  resolveTelegramThreadDecision,
+} from './telegram-threading.js';
+import {
   Channel,
   OnChatMetadata,
   OnInboundMessage,
   RegisteredGroup,
 } from '../types.js';
+
+const TELEGRAM_MEDIA_DOWNLOAD_TIMEOUT_MS = 30_000;
 
 export interface TelegramChannelOpts {
   onMessage: OnInboundMessage;
@@ -32,18 +39,42 @@ async function sendTelegramMessage(
   api: { sendMessage: Api['sendMessage'] },
   chatId: string | number,
   text: string,
-  options: { message_thread_id?: number } = {},
 ): Promise<void> {
   try {
     await api.sendMessage(chatId, text, {
-      ...options,
       parse_mode: 'Markdown',
     });
   } catch (err) {
     // Fallback: send as plain text if Markdown parsing fails
     logger.debug({ err }, 'Markdown send failed, falling back to plain text');
-    await api.sendMessage(chatId, text, options);
+    await api.sendMessage(chatId, text, {});
   }
+}
+
+function withTimeout<T>(
+  promise: Promise<T>,
+  ms: number,
+): Promise<
+  | { ok: true; value: T }
+  | { ok: false; reason: 'timeout' }
+  | { ok: false; reason: 'rejected'; error: unknown }
+> {
+  return new Promise((resolve) => {
+    const timer = setTimeout(
+      () => resolve({ ok: false, reason: 'timeout' }),
+      ms,
+    );
+    promise.then(
+      (value) => {
+        clearTimeout(timer);
+        resolve({ ok: true, value });
+      },
+      (error) => {
+        clearTimeout(timer);
+        resolve({ ok: false, reason: 'rejected', error });
+      },
+    );
+  });
 }
 
 export class TelegramChannel implements Channel {
@@ -61,6 +92,17 @@ export class TelegramChannel implements Channel {
     this.opts = opts;
   }
 
+  private getChatLookup():
+    | ((chatId: string | number) => Promise<{ is_forum?: boolean }>)
+    | undefined {
+    const bot = this.bot;
+    const getChat = bot?.api.getChat;
+    if (!bot || typeof getChat !== 'function') return undefined;
+    return getChat.bind(bot.api) as (
+      chatId: string | number,
+    ) => Promise<{ is_forum?: boolean }>;
+  }
+
   /**
    * Download a Telegram file to the group's attachments directory.
    * Returns the container-relative path (e.g. /workspace/group/attachments/photo_123.jpg)
@@ -74,7 +116,19 @@ export class TelegramChannel implements Channel {
     if (!this.bot) return null;
 
     try {
-      const file = await this.bot.api.getFile(fileId);
+      const fileLookup = await withTimeout(
+        this.bot.api.getFile(fileId),
+        TELEGRAM_MEDIA_DOWNLOAD_TIMEOUT_MS,
+      );
+      if (!fileLookup.ok) {
+        if (fileLookup.reason === 'rejected') {
+          throw fileLookup.error;
+        }
+        logger.warn({ fileId }, 'Telegram getFile timed out');
+        return null;
+      }
+
+      const file = fileLookup.value;
       if (!file.file_path) {
         logger.warn({ fileId }, 'Telegram getFile returned no file_path');
         return null;
@@ -92,7 +146,21 @@ export class TelegramChannel implements Channel {
       const destPath = path.join(attachDir, finalName);
 
       const fileUrl = `https://api.telegram.org/file/bot${this.botToken}/${file.file_path}`;
-      const resp = await this.telegramFetch(fileUrl);
+      const controller = new AbortController();
+      const fetchLookup = await withTimeout(
+        this.telegramFetch(fileUrl, { signal: controller.signal }),
+        TELEGRAM_MEDIA_DOWNLOAD_TIMEOUT_MS,
+      );
+      if (!fetchLookup.ok) {
+        if (fetchLookup.reason === 'rejected') {
+          throw fetchLookup.error;
+        }
+        controller.abort();
+        logger.warn({ fileId }, 'Telegram file download timed out');
+        return null;
+      }
+
+      const resp = fetchLookup.value;
       if (!resp.ok) {
         logger.warn(
           { fileId, status: resp.status },
@@ -101,7 +169,20 @@ export class TelegramChannel implements Channel {
         return null;
       }
 
-      const buffer = Buffer.from(await resp.arrayBuffer());
+      const bodyLookup = await withTimeout(
+        resp.arrayBuffer(),
+        TELEGRAM_MEDIA_DOWNLOAD_TIMEOUT_MS,
+      );
+      if (!bodyLookup.ok) {
+        if (bodyLookup.reason === 'rejected') {
+          throw bodyLookup.error;
+        }
+        controller.abort();
+        logger.warn({ fileId }, 'Telegram file body download timed out');
+        return null;
+      }
+
+      const buffer = Buffer.from(bodyLookup.value);
       fs.writeFileSync(destPath, buffer);
 
       logger.info({ fileId, dest: destPath }, 'Telegram file downloaded');
@@ -162,25 +243,88 @@ export class TelegramChannel implements Channel {
       const msgId = ctx.message.message_id.toString();
       const threadId = ctx.message.message_thread_id;
 
-      const replyTo = ctx.message.reply_to_message;
-      const replyToMessageId = replyTo?.message_id?.toString();
-      const replyToContent = replyTo?.text || replyTo?.caption;
-      const replyToIsBot =
-        replyTo?.from?.id !== undefined && ctx.me?.id !== undefined
-          ? replyTo.from.id === ctx.me.id
-          : undefined;
-      const replyToSenderName = replyTo
-        ? replyTo.from?.first_name ||
-          replyTo.from?.username ||
-          replyTo.from?.id?.toString() ||
-          'Unknown'
-        : undefined;
-
       // Determine chat name
       const chatName =
         ctx.chat.type === 'private'
           ? senderName
           : (ctx.chat as any).title || chatJid;
+
+      // Store chat metadata for discovery
+      const isGroup =
+        ctx.chat.type === 'group' || ctx.chat.type === 'supergroup';
+      this.opts.onChatMetadata(
+        chatJid,
+        timestamp,
+        chatName,
+        'telegram',
+        isGroup,
+      );
+
+      if (isTelegramForumServiceMessage(ctx.message)) {
+        logger.warn(
+          {
+            chatJid,
+            messageId: msgId,
+            threadId,
+            reason: 'forum_service_message',
+          },
+          'Telegram service message ignored',
+        );
+        return;
+      }
+
+      const group = this.opts.registeredGroups()[chatJid];
+
+      const threadDecision = await resolveTelegramThreadDecision({
+        chat: ctx.chat as {
+          id: string | number;
+          type: string;
+          is_forum?: boolean;
+        },
+        messageThreadId: threadId,
+        isRegistered: Boolean(group),
+        getChat: this.getChatLookup(),
+      });
+
+      if (!threadDecision.deliverable) {
+        const logData = {
+          chatJid,
+          messageId: msgId,
+          threadId,
+          reason: threadDecision.reason,
+        };
+        if (threadDecision.reason === 'unregistered_chat') {
+          logger.debug(
+            logData,
+            'Telegram threaded message from unregistered chat',
+          );
+        } else {
+          logger.warn(logData, 'Telegram forum message ignored');
+        }
+        return;
+      }
+
+      if (threadDecision.diagnosticReason) {
+        logger.debug(
+          {
+            chatJid,
+            messageId: msgId,
+            threadId,
+            deliverable: true,
+            reason: threadDecision.diagnosticReason,
+          },
+          'Telegram forum status lookup treated as non-forum',
+        );
+      }
+
+      // Only deliver full message for registered groups
+      if (!group) {
+        logger.debug(
+          { chatJid, chatName },
+          'Message from unregistered Telegram chat',
+        );
+        return;
+      }
 
       // Translate Telegram @bot_username mentions into TRIGGER_PATTERN format.
       // Telegram @mentions (e.g., @andy_ai_bot) won't match TRIGGER_PATTERN
@@ -202,34 +346,10 @@ export class TelegramChannel implements Channel {
         }
       }
 
-      // Store chat metadata for discovery
-      const isGroup =
-        ctx.chat.type === 'group' || ctx.chat.type === 'supergroup';
-      this.opts.onChatMetadata(
-        chatJid,
-        timestamp,
-        chatName,
-        'telegram',
-        isGroup,
-      );
-
-      if (threadId !== undefined) {
-        logger.warn(
-          { chatJid, threadId },
-          'Telegram forum topics are not supported yet; ignoring topic message',
-        );
-        return;
-      }
-
-      // Only deliver full message for registered groups
-      const group = this.opts.registeredGroups()[chatJid];
-      if (!group) {
-        logger.debug(
-          { chatJid, chatName },
-          'Message from unregistered Telegram chat',
-        );
-        return;
-      }
+      const replyMetadata = extractTelegramReplyMetadata({
+        replyTo: ctx.message.reply_to_message,
+        botId: ctx.me?.id,
+      });
 
       // Deliver message — startMessageLoop() will pick it up
       this.opts.onMessage(chatJid, {
@@ -240,10 +360,7 @@ export class TelegramChannel implements Channel {
         content,
         timestamp,
         is_from_me: false,
-        reply_to_message_id: replyToMessageId,
-        reply_to_message_content: replyToContent,
-        reply_to_sender_name: replyToSenderName,
-        reply_to_is_bot: replyToIsBot,
+        ...replyMetadata,
       });
 
       logger.info(
@@ -253,13 +370,15 @@ export class TelegramChannel implements Channel {
     });
 
     // Handle non-text messages: download files when possible, fall back to placeholders.
-    const storeMedia = (
+    const storeMedia = async (
       ctx: any,
       placeholder: string,
       opts?: { fileId?: string; filename?: string },
     ) => {
       const chatJid = `tg:${ctx.chat.id}`;
       const timestamp = new Date(ctx.message.date * 1000).toISOString();
+      const msgId = ctx.message.message_id.toString();
+      const threadId = ctx.message.message_thread_id;
       const senderName =
         ctx.from?.first_name ||
         ctx.from?.username ||
@@ -277,95 +396,154 @@ export class TelegramChannel implements Channel {
         isGroup,
       );
 
-      if (ctx.message.message_thread_id !== undefined) {
+      if (isTelegramForumServiceMessage(ctx.message)) {
         logger.warn(
           {
             chatJid,
-            threadId: ctx.message.message_thread_id,
+            messageId: msgId,
+            threadId,
+            reason: 'forum_service_message',
           },
-          'Telegram forum topics are not supported yet; ignoring topic media message',
+          'Telegram service message ignored',
         );
         return;
       }
 
       const group = this.opts.registeredGroups()[chatJid];
+
+      const threadDecision = await resolveTelegramThreadDecision({
+        chat: ctx.chat as {
+          id: string | number;
+          type: string;
+          is_forum?: boolean;
+        },
+        messageThreadId: threadId,
+        isRegistered: Boolean(group),
+        getChat: this.getChatLookup(),
+      });
+
+      if (!threadDecision.deliverable) {
+        const logData = {
+          chatJid,
+          messageId: msgId,
+          threadId,
+          reason: threadDecision.reason,
+        };
+        if (threadDecision.reason === 'unregistered_chat') {
+          logger.debug(
+            logData,
+            'Telegram threaded media from unregistered chat',
+          );
+        } else {
+          logger.warn(logData, 'Telegram forum media ignored');
+        }
+        return;
+      }
+
+      if (threadDecision.diagnosticReason) {
+        logger.debug(
+          {
+            chatJid,
+            messageId: msgId,
+            threadId,
+            deliverable: true,
+            reason: threadDecision.diagnosticReason,
+          },
+          'Telegram forum status lookup treated as non-forum',
+        );
+      }
+
       if (!group) return;
+
+      const replyMetadata = extractTelegramReplyMetadata({
+        replyTo: ctx.message.reply_to_message,
+        botId: ctx.me?.id,
+      });
 
       const deliver = (content: string) => {
         this.opts.onMessage(chatJid, {
-          id: ctx.message.message_id.toString(),
+          id: msgId,
           chat_jid: chatJid,
           sender: ctx.from?.id?.toString() || '',
           sender_name: senderName,
           content,
           timestamp,
           is_from_me: false,
+          ...replyMetadata,
         });
       };
 
-      // If we have a file_id, attempt to download; deliver asynchronously
+      // If we have a file_id, attempt to download after routing is confirmed.
       if (opts?.fileId) {
-        const msgId = ctx.message.message_id.toString();
         const filename =
           opts.filename ||
-          `${placeholder.replace(/[\[\] ]/g, '').toLowerCase()}_${msgId}`;
-        this.downloadFile(opts.fileId, group.folder, filename).then(
-          (filePath) => {
-            if (filePath) {
-              deliver(`${placeholder} (${filePath})${caption}`);
-            } else {
-              deliver(`${placeholder}${caption}`);
-            }
-          },
+          `${placeholder
+            .replaceAll('[', '')
+            .replaceAll(']', '')
+            .replaceAll(' ', '')
+            .toLowerCase()}_${msgId}`;
+        const filePath = await this.downloadFile(
+          opts.fileId,
+          group.folder,
+          filename,
         );
+        if (filePath) {
+          deliver(`${placeholder} (${filePath})${caption}`);
+        } else {
+          deliver(`${placeholder}${caption}`);
+        }
         return;
       }
 
       deliver(`${placeholder}${caption}`);
     };
 
-    this.bot.on('message:photo', (ctx) => {
+    this.bot.on('message:photo', async (ctx) => {
       // Telegram sends multiple sizes; last is largest
       const photos = ctx.message.photo;
       const largest = photos?.[photos.length - 1];
-      storeMedia(ctx, '[Photo]', {
+      await storeMedia(ctx, '[Photo]', {
         fileId: largest?.file_id,
         filename: `photo_${ctx.message.message_id}`,
       });
     });
-    this.bot.on('message:video', (ctx) => {
-      storeMedia(ctx, '[Video]', {
+    this.bot.on('message:video', async (ctx) => {
+      await storeMedia(ctx, '[Video]', {
         fileId: ctx.message.video?.file_id,
         filename: `video_${ctx.message.message_id}`,
       });
     });
-    this.bot.on('message:voice', (ctx) => {
-      storeMedia(ctx, '[Voice message]', {
+    this.bot.on('message:voice', async (ctx) => {
+      await storeMedia(ctx, '[Voice message]', {
         fileId: ctx.message.voice?.file_id,
         filename: `voice_${ctx.message.message_id}`,
       });
     });
-    this.bot.on('message:audio', (ctx) => {
+    this.bot.on('message:audio', async (ctx) => {
       const name =
         ctx.message.audio?.file_name || `audio_${ctx.message.message_id}`;
-      storeMedia(ctx, '[Audio]', {
+      await storeMedia(ctx, '[Audio]', {
         fileId: ctx.message.audio?.file_id,
         filename: name,
       });
     });
-    this.bot.on('message:document', (ctx) => {
+    this.bot.on('message:document', async (ctx) => {
       const name = ctx.message.document?.file_name || 'file';
-      storeMedia(ctx, `[Document: ${name}]`, {
+      await storeMedia(ctx, `[Document: ${name}]`, {
         fileId: ctx.message.document?.file_id,
         filename: name,
       });
     });
-    this.bot.on('message:sticker', (ctx) => {
+    this.bot.on('message:sticker', async (ctx) => {
       const emoji = ctx.message.sticker?.emoji || '';
-      storeMedia(ctx, `[Sticker ${emoji}]`);
+      await storeMedia(ctx, `[Sticker ${emoji}]`);
     });
-    this.bot.on('message:location', (ctx) => storeMedia(ctx, '[Location]'));
-    this.bot.on('message:contact', (ctx) => storeMedia(ctx, '[Contact]'));
+    this.bot.on('message:location', async (ctx) => {
+      await storeMedia(ctx, '[Location]');
+    });
+    this.bot.on('message:contact', async (ctx) => {
+      await storeMedia(ctx, '[Contact]');
+    });
 
     // Handle errors gracefully
     this.bot.catch((err) => {

@@ -226,6 +226,55 @@ describe('reply context', () => {
     expect(messages[0].reply_to_sender_name).toBe('Dave');
     expect(messages[0].reply_to_is_bot).toBe(true);
   });
+
+  it('stores reply_to_is_bot false when reply is not to bot', () => {
+    storeChatMetadata('group@g.us', '2024-01-01T00:00:00.000Z');
+
+    storeMessage({
+      id: 'reply-human',
+      chat_jid: 'group@g.us',
+      sender: '123',
+      sender_name: 'Alice',
+      content: 'Human reply',
+      timestamp: '2024-01-01T00:00:01.000Z',
+      reply_to_message_id: '100',
+      reply_to_message_content: 'Human context',
+      reply_to_sender_name: 'Bob',
+      reply_to_is_bot: false,
+    });
+
+    const messages = getMessagesSince(
+      'group@g.us',
+      '2024-01-01T00:00:00.000Z',
+      'Andy',
+    );
+    expect(messages).toHaveLength(1);
+    expect(messages[0].reply_to_is_bot).toBe(false);
+  });
+
+  it('stores missing reply_to_is_bot as not reply_to_bot', () => {
+    storeChatMetadata('group@g.us', '2024-01-01T00:00:00.000Z');
+
+    storeMessage({
+      id: 'reply-unknown',
+      chat_jid: 'group@g.us',
+      sender: '123',
+      sender_name: 'Alice',
+      content: 'Unknown bot id reply',
+      timestamp: '2024-01-01T00:00:01.000Z',
+      reply_to_message_id: '101',
+      reply_to_message_content: 'Maybe bot context',
+      reply_to_sender_name: 'Unknown',
+    });
+
+    const messages = getMessagesSince(
+      'group@g.us',
+      '2024-01-01T00:00:00.000Z',
+      'Andy',
+    );
+    expect(messages).toHaveLength(1);
+    expect(messages[0].reply_to_is_bot).toBe(false);
+  });
 });
 
 // --- getMessagesSince ---
