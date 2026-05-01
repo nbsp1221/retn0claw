@@ -78,7 +78,6 @@ function createChannel(jid = 'tg:-100') {
     name: 'telegram',
     ownsJid: (candidate: string) => candidate === jid,
     sendMessage: vi.fn(async () => {}),
-    setTyping: vi.fn(async () => {}),
     getAssistantAliases: vi.fn(() => ['@retn0testerbot']),
   };
 }
@@ -206,7 +205,6 @@ describe('orchestration integration: chat surface routing', () => {
         name: 'telegram',
         ownsJid: (jid: string) => jid === 'tg:12345',
         sendMessage: vi.fn(async () => {}),
-        setTyping: vi.fn(async () => {}),
         getAssistantAliases: vi.fn(() => ['@retn0testerbot']),
       } as any,
     ]);
@@ -242,7 +240,6 @@ describe('orchestration integration: chat surface routing', () => {
         name: 'telegram',
         ownsJid: (jid: string) => jid === 'tg:-200',
         sendMessage: vi.fn(async () => {}),
-        setTyping: vi.fn(async () => {}),
         getAssistantAliases: vi.fn(() => ['@retn0testerbot']),
       } as any,
     ]);
@@ -517,7 +514,6 @@ describe('orchestration integration: chat surface routing', () => {
         name: 'telegram',
         ownsJid: (jid: string) => jid === chatJid,
         sendMessage: vi.fn(async () => {}),
-        setTyping: vi.fn(async () => {}),
         getAssistantAliases: vi.fn(() => ['@retn0testerbot']),
       } as any,
     ]);

@@ -65,6 +65,7 @@ import {
 import { startSessionCleanup } from './session-cleanup.js';
 import { startSchedulerLoop } from './task-scheduler.js';
 import {
+  createSyntheticTurnId,
   getSelectedRunnerKind,
   isTerminalRunnerOutput,
   type RunnerKind,
@@ -87,6 +88,11 @@ import {
   type ChatSurfaceMessage,
   selectChatSurfaceMessages,
 } from './prompt/chat-surface.js';
+import {
+  createChannelFeedbackController,
+  type ChannelFeedbackController,
+} from './feedback/channel-feedback-controller.js';
+import type { FeedbackTarget } from './feedback/types.js';
 
 // Re-export for backwards compatibility during refactor
 export { escapeXml, formatMessages } from './router.js';
@@ -99,6 +105,9 @@ let messageLoopRunning = false;
 
 const channels: Channel[] = [];
 const queue = new GroupQueue();
+let feedbackController: ChannelFeedbackController =
+  createChannelFeedbackController();
+const activeRuntimeFeedbackTargets = new Map<string, FeedbackTarget>();
 
 const onecli = new OneCLI({ url: ONECLI_URL });
 
@@ -250,6 +259,21 @@ export function _setChannelsForTests(nextChannels: Channel[]): void {
   channels.push(...nextChannels);
 }
 
+/** @internal - exported for testing */
+export function _setFeedbackControllerForTests(
+  controller: ChannelFeedbackController,
+): void {
+  feedbackController.shutdown();
+  feedbackController = controller;
+}
+
+/** @internal - exported for testing */
+export function _resetFeedbackControllerForTests(): void {
+  feedbackController.shutdown();
+  feedbackController = createChannelFeedbackController();
+  activeRuntimeFeedbackTargets.clear();
+}
+
 function normalizePlatform(value: string | null | undefined): ChatPlatform {
   return value === 'telegram' || value === 'discord' ? value : 'unknown';
 }
@@ -375,6 +399,16 @@ function buildRunnerPrompt(input: {
   };
 }
 
+function feedbackTargetForRunnerOutput(
+  output: RunnerOutput,
+  fallback: FeedbackTarget,
+): FeedbackTarget {
+  return {
+    ...fallback,
+    turnId: output.turnId ?? fallback.turnId,
+  };
+}
+
 /**
  * Process all pending messages for a group.
  * Called by the GroupQueue when it's this group's turn.
@@ -441,11 +475,20 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
     }, IDLE_TIMEOUT);
   };
 
-  await channel.setTyping?.(chatJid, true);
   let hadError = false;
   let outputSentToUser = false;
   const runId = randomUUID();
   const runnerKind = getSelectedRunnerKind();
+  const baseFeedbackTarget: FeedbackTarget = {
+    chatJid,
+    runId,
+    turnId: createSyntheticTurnId(runnerKind, runId),
+  };
+  activeRuntimeFeedbackTargets.set(chatJid, baseFeedbackTarget);
+  feedbackController.start({
+    target: baseFeedbackTarget,
+    feedback: channel.feedback,
+  });
   let latestSessionId: string | null = null;
   const createAudit = createRunnerOutputAuditLoggerFactory(
     {
@@ -465,46 +508,76 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
     prompt,
     chatJid,
     async (result) => {
-      if (result.newSessionId) {
-        latestSessionId = result.newSessionId;
+      const feedbackTarget = feedbackTargetForRunnerOutput(
+        result,
+        baseFeedbackTarget,
+      );
+      if (
+        result.eventKind === 'turn_started' ||
+        result.eventKind === 'progress'
+      ) {
+        feedbackController.start({
+          target: feedbackTarget,
+          feedback: channel.feedback,
+        });
       }
-      const delivery = deliveryTurnManager.consume(result);
+      const terminal = isTerminalRunnerOutput(result);
+      if (terminal) {
+        feedbackController.markRunComplete(feedbackTarget);
+      }
 
-      if (delivery.sendText) {
-        const raw =
-          typeof delivery.sendText === 'string'
-            ? delivery.sendText
-            : JSON.stringify(delivery.sendText);
-        // Strip <internal>...</internal> blocks — agent uses these for internal reasoning
-        const text = raw.replace(/<internal>[\s\S]*?<\/internal>/g, '').trim();
-        logger.info({ group: group.name }, `Agent output: ${raw.length} chars`);
-        if (text) {
-          try {
-            await channel.sendMessage(chatJid, text);
-            createAudit(result).finalSent(text);
-          } catch (error) {
-            createAudit(result).finalFailed(
-              error instanceof Error ? error.message : String(error),
-            );
-            throw error;
-          }
-          outputSentToUser = true;
+      try {
+        if (result.newSessionId) {
+          latestSessionId = result.newSessionId;
         }
-        resetIdleTimer();
-      }
+        const delivery = deliveryTurnManager.consume(result);
 
-      if (delivery.notifyIdle) {
-        queue.notifyIdle(chatJid);
-      }
+        if (delivery.sendText) {
+          const raw =
+            typeof delivery.sendText === 'string'
+              ? delivery.sendText
+              : JSON.stringify(delivery.sendText);
+          // Strip <internal>...</internal> blocks — agent uses these for internal reasoning
+          const text = raw
+            .replace(/<internal>[\s\S]*?<\/internal>/g, '')
+            .trim();
+          logger.info(
+            { group: group.name },
+            `Agent output: ${raw.length} chars`,
+          );
+          if (text) {
+            try {
+              await channel.sendMessage(chatJid, text);
+              createAudit(result).finalSent(text);
+            } catch (error) {
+              createAudit(result).finalFailed(
+                error instanceof Error ? error.message : String(error),
+              );
+              throw error;
+            }
+            outputSentToUser = true;
+          }
+          resetIdleTimer();
+        }
 
-      if (result.status === 'error') {
-        hadError = true;
+        if (delivery.notifyIdle) {
+          queue.notifyIdle(chatJid);
+        }
+
+        if (result.status === 'error') {
+          hadError = true;
+        }
+      } finally {
+        if (terminal) {
+          feedbackController.markDeliveryIdle(feedbackTarget);
+        }
       }
     },
     runId,
   );
 
-  await channel.setTyping?.(chatJid, false);
+  feedbackController.stopActive(chatJid, 'run_returned');
+  activeRuntimeFeedbackTargets.delete(chatJid);
   if (idleTimer) clearTimeout(idleTimer);
 
   if (output === 'error' || hadError) {
@@ -604,6 +677,120 @@ export { runAgent as _runAgentForTests };
 /** @internal - exported for testing */
 export { processGroupMessages as _processGroupMessagesForTests };
 
+interface ActiveRuntimeFollowUpInput {
+  chatJid: string;
+  prompt: string;
+  channel: Channel;
+  sendMessage?: (chatJid: string, prompt: string) => boolean;
+}
+
+function pipeActiveRuntimeFollowUp({
+  chatJid,
+  prompt,
+  channel,
+  sendMessage = queue.sendMessage.bind(queue),
+}: ActiveRuntimeFollowUpInput): boolean {
+  if (!sendMessage(chatJid, prompt)) return false;
+
+  feedbackController.touchActive({
+    chatJid,
+    feedback: channel.feedback,
+    createFallbackTarget: () => {
+      const activeRuntimeTarget = activeRuntimeFeedbackTargets.get(chatJid);
+      if (activeRuntimeTarget) return activeRuntimeTarget;
+
+      const runId = `ipc-${randomUUID()}`;
+      return {
+        chatJid,
+        runId,
+        turnId: `ipc:${runId}:synthetic-turn`,
+      };
+    },
+  });
+  return true;
+}
+
+/** @internal - exported for testing */
+export { pipeActiveRuntimeFollowUp as _pipeActiveRuntimeFollowUpForTests };
+
+interface MessageLoopGroupMessagesInput {
+  chatJid: string;
+  groupMessages: NewMessage[];
+  sendActiveRuntimeMessage?: (chatJid: string, prompt: string) => boolean;
+}
+
+function processMessageLoopGroupMessages({
+  chatJid,
+  groupMessages,
+  sendActiveRuntimeMessage,
+}: MessageLoopGroupMessagesInput): void {
+  const group = registeredGroups[chatJid];
+  if (!group) return;
+
+  const channel = findChannel(channels, chatJid);
+  if (!channel) {
+    logger.warn({ chatJid }, 'No channel owns JID, skipping messages');
+    return;
+  }
+
+  const isMainGroup = group.isMain === true;
+  const needsTrigger = !isMainGroup && group.requiresTrigger !== false;
+  const runnerKindForPrompt = getSelectedRunnerKind();
+
+  if (needsTrigger && runnerKindForPrompt !== 'codex') {
+    if (!hasAllowedLegacyTrigger(chatJid, group, groupMessages)) {
+      return;
+    }
+  }
+
+  const allPending = getMessagesSince(
+    chatJid,
+    getOrRecoverCursor(chatJid),
+    ASSISTANT_NAME,
+    MAX_MESSAGES_PER_PROMPT,
+  );
+  const messagesToSend = allPending.length > 0 ? allPending : groupMessages;
+  const builtPrompt = buildRunnerPrompt({
+    chatJid,
+    group,
+    messages: messagesToSend,
+    runnerKind: runnerKindForPrompt,
+    legacyTriggerMessages: groupMessages,
+  });
+  if (!builtPrompt.prompt) {
+    if (builtPrompt.cursorTimestamp) {
+      lastAgentTimestamp[chatJid] = builtPrompt.cursorTimestamp;
+      saveState();
+    }
+    return;
+  }
+  const formatted = builtPrompt.prompt;
+  const cursorTimestamp =
+    builtPrompt.cursorTimestamp ??
+    messagesToSend[messagesToSend.length - 1].timestamp;
+
+  if (
+    pipeActiveRuntimeFollowUp({
+      chatJid,
+      prompt: formatted,
+      channel,
+      sendMessage: sendActiveRuntimeMessage,
+    })
+  ) {
+    logger.debug(
+      { chatJid, count: messagesToSend.length },
+      'Piped messages to active container',
+    );
+    lastAgentTimestamp[chatJid] = cursorTimestamp;
+    saveState();
+  } else {
+    queue.enqueueMessageCheck(chatJid);
+  }
+}
+
+/** @internal - exported for testing */
+export { processMessageLoopGroupMessages as _processMessageLoopGroupMessagesForTests };
+
 async function startMessageLoop(): Promise<void> {
   if (messageLoopRunning) {
     logger.debug('Message loop already running, skipping duplicate start');
@@ -641,74 +828,7 @@ async function startMessageLoop(): Promise<void> {
         }
 
         for (const [chatJid, groupMessages] of messagesByGroup) {
-          const group = registeredGroups[chatJid];
-          if (!group) continue;
-
-          const channel = findChannel(channels, chatJid);
-          if (!channel) {
-            logger.warn({ chatJid }, 'No channel owns JID, skipping messages');
-            continue;
-          }
-
-          const isMainGroup = group.isMain === true;
-          const needsTrigger = !isMainGroup && group.requiresTrigger !== false;
-          const runnerKindForPrompt = getSelectedRunnerKind();
-
-          // For non-main groups, only act on trigger messages.
-          // Non-trigger messages accumulate in DB and get pulled as
-          // context when a trigger eventually arrives.
-          if (needsTrigger && runnerKindForPrompt !== 'codex') {
-            if (!hasAllowedLegacyTrigger(chatJid, group, groupMessages)) {
-              continue;
-            }
-          }
-
-          // Pull all messages since lastAgentTimestamp so non-trigger
-          // context that accumulated between triggers is included.
-          const allPending = getMessagesSince(
-            chatJid,
-            getOrRecoverCursor(chatJid),
-            ASSISTANT_NAME,
-            MAX_MESSAGES_PER_PROMPT,
-          );
-          const messagesToSend =
-            allPending.length > 0 ? allPending : groupMessages;
-          const builtPrompt = buildRunnerPrompt({
-            chatJid,
-            group,
-            messages: messagesToSend,
-            runnerKind: runnerKindForPrompt,
-            legacyTriggerMessages: groupMessages,
-          });
-          if (!builtPrompt.prompt) {
-            if (builtPrompt.cursorTimestamp) {
-              lastAgentTimestamp[chatJid] = builtPrompt.cursorTimestamp;
-              saveState();
-            }
-            continue;
-          }
-          const formatted = builtPrompt.prompt;
-          const cursorTimestamp =
-            builtPrompt.cursorTimestamp ??
-            messagesToSend[messagesToSend.length - 1].timestamp;
-
-          if (queue.sendMessage(chatJid, formatted)) {
-            logger.debug(
-              { chatJid, count: messagesToSend.length },
-              'Piped messages to active container',
-            );
-            lastAgentTimestamp[chatJid] = cursorTimestamp;
-            saveState();
-            // Show typing indicator while the container processes the piped message
-            channel
-              .setTyping?.(chatJid, true)
-              ?.catch((err) =>
-                logger.warn({ chatJid, err }, 'Failed to set typing indicator'),
-              );
-          } else {
-            // No active container — enqueue for a new one
-            queue.enqueueMessageCheck(chatJid);
-          }
+          processMessageLoopGroupMessages({ chatJid, groupMessages });
         }
       }
     } catch (err) {

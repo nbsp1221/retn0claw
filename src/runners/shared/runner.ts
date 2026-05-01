@@ -129,6 +129,13 @@ function normalizeRunnerOutput(
 
 export type RunnerKind = 'claude' | 'codex';
 
+export function createSyntheticTurnId(
+  runnerKind: RunnerKind,
+  runId: string | undefined,
+): string {
+  return `${runnerKind}:${runId ?? randomUUID()}:synthetic-turn`;
+}
+
 export interface RunDefaultRunnerArgs {
   group: RegisteredGroup;
   input: Omit<RunnerInput, 'sessionId'> & { sessionId?: string };
@@ -196,7 +203,7 @@ class ClaudeContainerRunner implements Runner {
     }
 
     const normalizationContext: RunnerNormalizationContext = {
-      syntheticTurnId: `claude-turn-${randomUUID()}`,
+      syntheticTurnId: createSyntheticTurnId('claude', input.runId),
       lastThreadId: input.sessionId ?? null,
     };
 
@@ -250,7 +257,7 @@ class CodexRunner implements Runner {
       sessionId: args.input.sessionId ?? session.get(),
     };
     const normalizationContext: RunnerNormalizationContext = {
-      syntheticTurnId: `codex-turn-${randomUUID()}`,
+      syntheticTurnId: createSyntheticTurnId('codex', input.runId),
       lastThreadId: input.sessionId ?? null,
     };
 

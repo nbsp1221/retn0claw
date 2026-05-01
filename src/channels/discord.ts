@@ -8,6 +8,7 @@ import {
 
 import { ASSISTANT_NAME, TRIGGER_PATTERN } from '../config.js';
 import { readEnvFile } from '../env.js';
+import type { FeedbackPulseResult, FeedbackTarget } from '../feedback/types.js';
 import { logger } from '../logger.js';
 import { registerChannel, ChannelOpts } from './registry.js';
 import {
@@ -29,6 +30,36 @@ export class DiscordChannel implements Channel {
   private client: Client | null = null;
   private opts: DiscordChannelOpts;
   private botToken: string;
+
+  feedback = {
+    typingExpiresAfterMs: 10_000,
+    recommendedRefreshMs: 8_000,
+    pulseTyping: async (
+      target: FeedbackTarget,
+    ): Promise<FeedbackPulseResult> => {
+      if (!this.client) return { ok: false, kind: 'unsupported' };
+
+      try {
+        const channelId = (target.threadId ?? target.chatJid).replace(
+          /^dc:/,
+          '',
+        );
+        const channel = await this.client.channels.fetch(channelId);
+        if (!channel || !('sendTyping' in channel)) {
+          return { ok: false, kind: 'unsupported' };
+        }
+
+        await (channel as TextChannel).sendTyping();
+        return { ok: true };
+      } catch (err) {
+        logger.debug(
+          { jid: target.chatJid, err },
+          'Failed to send Discord typing indicator',
+        );
+        return normalizeDiscordFeedbackError(err);
+      }
+    },
+  };
 
   constructor(botToken: string, opts: DiscordChannelOpts) {
     this.botToken = botToken;
@@ -263,19 +294,33 @@ export class DiscordChannel implements Channel {
       logger.info('Discord bot stopped');
     }
   }
+}
 
-  async setTyping(jid: string, isTyping: boolean): Promise<void> {
-    if (!this.client || !isTyping) return;
-    try {
-      const channelId = jid.replace(/^dc:/, '');
-      const channel = await this.client.channels.fetch(channelId);
-      if (channel && 'sendTyping' in channel) {
-        await (channel as TextChannel).sendTyping();
-      }
-    } catch (err) {
-      logger.debug({ jid, err }, 'Failed to send Discord typing indicator');
-    }
+function normalizeDiscordFeedbackError(error: unknown): FeedbackPulseResult {
+  const record =
+    error && typeof error === 'object'
+      ? (error as Record<string, unknown>)
+      : {};
+  const status = record.status ?? record.statusCode ?? record.code;
+  if (status === 429 || status === '429') {
+    const retryAfter =
+      readNumber(record.retry_after) ?? readNumber(record.retryAfter);
+    return {
+      ok: false,
+      kind: 'rate_limited',
+      retryAfterMs: retryAfter === undefined ? undefined : retryAfter * 1000,
+      scope: 'channel',
+    };
   }
+
+  return { ok: false, kind: 'transient' };
+}
+
+function readNumber(value: unknown): number | undefined {
+  if (typeof value === 'number' && Number.isFinite(value)) return value;
+  if (typeof value !== 'string' || value.trim() === '') return undefined;
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : undefined;
 }
 
 registerChannel('discord', (opts: ChannelOpts) => {

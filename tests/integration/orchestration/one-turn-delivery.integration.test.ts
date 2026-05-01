@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 vi.hoisted(() => {
   process.env.DEFAULT_RUNNER = 'claude';
@@ -19,6 +19,7 @@ import {
 } from '../../../src/db.js';
 import {
   _processGroupMessagesForTests,
+  _resetFeedbackControllerForTests,
   _setChannelsForTests,
   _setRegisteredGroups,
   _setSessionsForTests,
@@ -39,7 +40,6 @@ function createChannel() {
     name: 'fake',
     ownsJid: (jid: string) => jid === 'test@g.us',
     sendMessage: vi.fn(async () => {}),
-    setTyping: vi.fn(async () => {}),
   };
 }
 
@@ -69,6 +69,11 @@ describe('orchestration integration: one turn delivery', () => {
       'whatsapp',
       true,
     );
+  });
+
+  afterEach(() => {
+    _resetFeedbackControllerForTests();
+    vi.useRealTimers();
   });
 
   it('progress storm and meta outputs still yield one visible final', async () => {
@@ -130,6 +135,144 @@ describe('orchestration integration: one turn delivery', () => {
     );
     expect(channel.sendMessage).toHaveBeenCalledTimes(1);
     expect(channel.sendMessage).toHaveBeenCalledWith('test@g.us', '최종 답변');
+  });
+
+  it('keeps channel feedback alive during a long user turn', async () => {
+    vi.useFakeTimers();
+    const pulseTyping = vi.fn(async () => ({ ok: true as const }));
+    const channel = {
+      name: 'fake',
+      ownsJid: (jid: string) => jid === 'test@g.us',
+      sendMessage: vi.fn(async () => {}),
+      feedback: {
+        typingExpiresAfterMs: 10_000,
+        recommendedRefreshMs: 8_000,
+        pulseTyping,
+      },
+    };
+    _setChannelsForTests([channel as any]);
+
+    storeMessage({
+      id: 'msg-feedback-1',
+      chat_jid: 'test@g.us',
+      sender: 'user-1',
+      sender_name: 'retn0',
+      content: 'long work',
+      timestamp: '2026-04-23T00:00:01.500Z',
+      is_from_me: false,
+    });
+
+    let finish!: () => void;
+    vi.mocked(runContainerAgent).mockImplementation(
+      async (_group, _input, _onProcess, onOutput) => {
+        await new Promise<void>((resolve) => {
+          finish = resolve;
+        });
+        await onOutput?.({
+          status: 'success',
+          result: 'done',
+          newSessionId: 'thread-1',
+        });
+        return { status: 'success', result: 'done', newSessionId: 'thread-1' };
+      },
+    );
+
+    const processing = _processGroupMessagesForTests('test@g.us');
+    await vi.advanceTimersByTimeAsync(1);
+
+    expect(pulseTyping).toHaveBeenCalledTimes(1);
+
+    await vi.advanceTimersByTimeAsync(8_000);
+    expect(pulseTyping).toHaveBeenCalledTimes(2);
+
+    finish();
+    await processing;
+
+    await vi.advanceTimersByTimeAsync(8_000);
+    expect(pulseTyping).toHaveBeenCalledTimes(2);
+    expect(channel.sendMessage).toHaveBeenCalledWith('test@g.us', 'done');
+  });
+
+  it('delivers final output without feedback capability or leftover timers', async () => {
+    vi.useFakeTimers();
+    const channel = createChannel();
+    _setChannelsForTests([channel as any]);
+    storeMessage({
+      id: 'msg-no-feedback',
+      chat_jid: 'test@g.us',
+      sender: 'user-1',
+      sender_name: 'retn0',
+      content: 'no feedback channel',
+      timestamp: '2026-04-23T00:00:02.000Z',
+      is_from_me: false,
+    });
+    vi.mocked(runContainerAgent).mockImplementation(
+      async (_group, _input, _onProcess, onOutput) => {
+        await onOutput?.(output({ result: 'still delivered' }));
+        return {
+          status: 'success',
+          result: 'still delivered',
+          newSessionId: 'thread-1',
+        };
+      },
+    );
+
+    await expect(_processGroupMessagesForTests('test@g.us')).resolves.toBe(
+      true,
+    );
+    await vi.advanceTimersByTimeAsync(8_000);
+
+    expect(channel.sendMessage).toHaveBeenCalledWith(
+      'test@g.us',
+      'still delivered',
+    );
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it('delivers final output when feedback pulses fail', async () => {
+    vi.useFakeTimers();
+    const pulseTyping = vi.fn(async () => {
+      throw new Error('typing unavailable');
+    });
+    const channel = {
+      ...createChannel(),
+      feedback: {
+        typingExpiresAfterMs: 10_000,
+        recommendedRefreshMs: 8_000,
+        pulseTyping,
+      },
+    };
+    _setChannelsForTests([channel as any]);
+    storeMessage({
+      id: 'msg-feedback-fails',
+      chat_jid: 'test@g.us',
+      sender: 'user-1',
+      sender_name: 'retn0',
+      content: 'feedback should not block final',
+      timestamp: '2026-04-23T00:00:02.500Z',
+      is_from_me: false,
+    });
+    vi.mocked(runContainerAgent).mockImplementation(
+      async (_group, _input, _onProcess, onOutput) => {
+        await onOutput?.(output({ result: 'final despite feedback failure' }));
+        return {
+          status: 'success',
+          result: 'final despite feedback failure',
+          newSessionId: 'thread-1',
+        };
+      },
+    );
+
+    const processing = _processGroupMessagesForTests('test@g.us');
+    await vi.advanceTimersByTimeAsync(1);
+    await expect(processing).resolves.toBe(true);
+
+    expect(pulseTyping).toHaveBeenCalled();
+    expect(channel.sendMessage).toHaveBeenCalledTimes(1);
+    expect(channel.sendMessage).toHaveBeenCalledWith(
+      'test@g.us',
+      'final despite feedback failure',
+    );
   });
 
   it('meta-only output remains invisible to the user', async () => {

@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 vi.hoisted(() => {
   process.env.DEFAULT_RUNNER = 'claude';
@@ -14,17 +14,26 @@ vi.mock('../../../src/runners/codex/codex-runner.js', () => ({
 
 import {
   _initTestDatabase,
+  getMessagesSince,
   storeChatMetadata,
   storeMessage,
 } from '../../../src/db.js';
 import {
   _processGroupMessagesForTests,
+  _processMessageLoopGroupMessagesForTests,
+  _resetFeedbackControllerForTests,
   _setChannelsForTests,
+  _setFeedbackControllerForTests,
   _setRegisteredGroups,
   _setSessionsForTests,
 } from '../../../src/index.js';
 import { runContainerAgent } from '../../../src/runners/claude/container-runner.js';
 import type { RunnerOutput } from '../../../src/runners/shared/runner.js';
+import { createChannelFeedbackController } from '../../../src/feedback/channel-feedback-controller.js';
+import type {
+  FeedbackPulseResult,
+  FeedbackTarget,
+} from '../../../src/feedback/types.js';
 
 const testGroup = {
   name: 'Test Group',
@@ -39,7 +48,6 @@ function createChannel() {
     name: 'fake',
     ownsJid: (jid: string) => jid === 'test@g.us',
     sendMessage: vi.fn(async () => {}),
-    setTyping: vi.fn(async () => {}),
   };
 }
 
@@ -69,6 +77,11 @@ describe('orchestration integration: queued follow-up', () => {
       'whatsapp',
       true,
     );
+  });
+
+  afterEach(() => {
+    _resetFeedbackControllerForTests();
+    vi.useRealTimers();
   });
 
   it('separate inbound turns each produce one final without replaying the earlier turn', async () => {
@@ -143,5 +156,94 @@ describe('orchestration integration: queued follow-up', () => {
       '두 번째 답변',
     );
     expect(channel.sendMessage).toHaveBeenCalledTimes(2);
+  });
+
+  it('routes accepted active-runtime follow-ups through the message-loop branch', async () => {
+    vi.useFakeTimers();
+    const pulseTyping = vi.fn(
+      async (_target: FeedbackTarget): Promise<FeedbackPulseResult> => ({
+        ok: true,
+      }),
+    );
+    _setFeedbackControllerForTests(createChannelFeedbackController());
+    const channel = {
+      ...createChannel(),
+      feedback: {
+        typingExpiresAfterMs: 10_000,
+        recommendedRefreshMs: 8_000,
+        pulseTyping,
+      },
+    };
+    _setChannelsForTests([channel as any]);
+    storeMessage({
+      id: 'msg-active-run',
+      chat_jid: 'test@g.us',
+      sender: 'user-1',
+      sender_name: 'retn0',
+      content: 'start long work',
+      timestamp: '2026-04-23T00:00:03.000Z',
+      is_from_me: false,
+    });
+
+    let finish!: () => void;
+    vi.mocked(runContainerAgent).mockImplementation(
+      async (_group, _input, _onProcess, onOutput) => {
+        await new Promise<void>((resolve) => {
+          finish = resolve;
+        });
+        await onOutput?.(output({ result: 'done' }));
+        return { status: 'success', result: 'done', newSessionId: 'thread-1' };
+      },
+    );
+    const processing = _processGroupMessagesForTests('test@g.us');
+    await vi.advanceTimersByTimeAsync(1);
+    expect(pulseTyping).toHaveBeenCalledTimes(1);
+    const activeTarget = pulseTyping.mock.calls[0]?.[0];
+    expect(activeTarget.runId).not.toMatch(/^ipc-/);
+
+    const followUpMessage = {
+      id: 'msg-follow-up-1',
+      chat_jid: 'test@g.us',
+      sender: 'user-1',
+      sender_name: 'retn0',
+      content: 'follow up',
+      timestamp: '2026-04-23T00:00:04.000Z',
+      is_from_me: false,
+    };
+    storeMessage(followUpMessage);
+    const groupMessages = getMessagesSince('test@g.us', '', 'Andy', 100);
+    const sendActiveRuntimeMessage = vi.fn(() => true);
+
+    _processMessageLoopGroupMessagesForTests({
+      chatJid: 'test@g.us',
+      groupMessages,
+      sendActiveRuntimeMessage,
+    });
+    await vi.advanceTimersByTimeAsync(1);
+
+    expect(sendActiveRuntimeMessage).toHaveBeenCalledWith(
+      'test@g.us',
+      expect.stringContaining('follow up'),
+    );
+    expect(pulseTyping).toHaveBeenCalledTimes(1);
+    expect(pulseTyping.mock.calls[0]?.[0]).toMatchObject({
+      chatJid: 'test@g.us',
+    });
+    expect(pulseTyping.mock.calls[0]?.[0].runId).toBe(activeTarget.runId);
+
+    _processMessageLoopGroupMessagesForTests({
+      chatJid: 'test@g.us',
+      groupMessages,
+      sendActiveRuntimeMessage,
+    });
+    await vi.advanceTimersByTimeAsync(1);
+    expect(pulseTyping).toHaveBeenCalledTimes(1);
+
+    await vi.advanceTimersByTimeAsync(8_000);
+    expect(pulseTyping).toHaveBeenCalledTimes(2);
+    expect(pulseTyping.mock.calls[1]?.[0].runId).toBe(activeTarget.runId);
+
+    finish();
+    await processing;
   });
 });

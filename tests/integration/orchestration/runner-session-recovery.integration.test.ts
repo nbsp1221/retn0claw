@@ -43,7 +43,6 @@ function createChannel() {
     name: 'fake',
     ownsJid: (jid: string) => jid === 'test@g.us',
     sendMessage: vi.fn(async () => {}),
-    setTyping: vi.fn(async () => {}),
   };
 }
 

@@ -1,3 +1,5 @@
+import type { ChannelFeedbackCapabilities } from './feedback/types.js';
+
 export interface AdditionalMount {
   hostPath: string; // Absolute path on host (supports ~ for home)
   containerPath?: string; // Optional — defaults to basename of hostPath. Mounted at /workspace/extra/{value}
@@ -102,8 +104,8 @@ export interface Channel {
   isConnected(): boolean;
   ownsJid(jid: string): boolean;
   disconnect(): Promise<void>;
-  // Optional: typing indicator. Channels that support it implement it.
-  setTyping?(jid: string, isTyping: boolean): Promise<void>;
+  // Optional: user-visible lifecycle feedback. Channels expose platform pulses.
+  feedback?: ChannelFeedbackCapabilities;
   // Optional: sync group/chat names from the platform.
   syncGroups?(force: boolean): Promise<void>;
   // Optional: transport-native bot aliases for mention cleanup and routing.

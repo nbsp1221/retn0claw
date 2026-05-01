@@ -2121,54 +2121,81 @@ describe('TelegramChannel', () => {
     });
   });
 
-  // --- setTyping ---
+  // --- feedback.pulseTyping ---
 
-  describe('setTyping', () => {
-    it('sends typing action when isTyping is true', async () => {
+  describe('feedback.pulseTyping', () => {
+    it('sends a one-shot typing pulse to the Telegram chat', async () => {
       const opts = createTestOpts();
       const channel = new TelegramChannel('test-token', opts);
       await channel.connect();
 
-      await channel.setTyping('tg:100200300', true);
+      const result = await channel.feedback.pulseTyping({
+        chatJid: 'tg:100200300',
+        runId: 'run-1',
+        turnId: 'turn-1',
+      });
 
+      expect(result).toEqual({ ok: true });
       expect(currentBot().api.sendChatAction).toHaveBeenCalledWith(
         '100200300',
         'typing',
       );
     });
 
-    it('does nothing when isTyping is false', async () => {
+    it('passes Telegram forum topic metadata when present', async () => {
       const opts = createTestOpts();
       const channel = new TelegramChannel('test-token', opts);
       await channel.connect();
 
-      await channel.setTyping('tg:100200300', false);
+      await channel.feedback.pulseTyping({
+        chatJid: 'tg:100200300',
+        runId: 'run-1',
+        turnId: 'turn-1',
+        telegramMessageThreadId: 42,
+      });
 
-      expect(currentBot().api.sendChatAction).not.toHaveBeenCalled();
-    });
-
-    it('does nothing when bot is not initialized', async () => {
-      const opts = createTestOpts();
-      const channel = new TelegramChannel('test-token', opts);
-
-      // Don't connect
-      await channel.setTyping('tg:100200300', true);
-
-      // No error, no API call
-    });
-
-    it('handles typing indicator failure gracefully', async () => {
-      const opts = createTestOpts();
-      const channel = new TelegramChannel('test-token', opts);
-      await channel.connect();
-
-      currentBot().api.sendChatAction.mockRejectedValueOnce(
-        new Error('Rate limited'),
+      expect(currentBot().api.sendChatAction).toHaveBeenCalledWith(
+        '100200300',
+        'typing',
+        { message_thread_id: 42 },
       );
+    });
 
-      await expect(
-        channel.setTyping('tg:100200300', true),
-      ).resolves.toBeUndefined();
+    it('reports unsupported when the bot is not initialized', async () => {
+      const opts = createTestOpts();
+      const channel = new TelegramChannel('test-token', opts);
+
+      const result = await channel.feedback.pulseTyping({
+        chatJid: 'tg:100200300',
+        runId: 'run-1',
+        turnId: 'turn-1',
+      });
+
+      expect(result).toEqual({ ok: false, kind: 'unsupported' });
+    });
+
+    it('reports channel-scoped rate limits', async () => {
+      const opts = createTestOpts();
+      const channel = new TelegramChannel('test-token', opts);
+      await channel.connect();
+
+      currentBot().api.sendChatAction.mockRejectedValueOnce({
+        error_code: 429,
+        parameters: { retry_after: 3 },
+      });
+
+      const result = await channel.feedback.pulseTyping({
+        chatJid: 'tg:100200300',
+        runId: 'run-1',
+        turnId: 'turn-1',
+      });
+
+      expect(result).toEqual({
+        ok: false,
+        kind: 'rate_limited',
+        retryAfterMs: 3000,
+        scope: 'channel',
+      });
     });
   });
 

@@ -6,6 +6,7 @@ import { Api, Bot } from 'grammy';
 
 import { ASSISTANT_NAME, TRIGGER_PATTERN } from '../config.js';
 import { readEnvFile } from '../env.js';
+import type { FeedbackPulseResult, FeedbackTarget } from '../feedback/types.js';
 import { resolveGroupFolderPath } from '../group-folder.js';
 import { logger } from '../logger.js';
 import { createTelegramFetch } from './telegram-fetch.js';
@@ -86,6 +87,37 @@ export class TelegramChannel implements Channel {
   private started = false;
   private telegramFetch = createTelegramFetch();
   private botUsername: string | undefined;
+
+  feedback = {
+    typingExpiresAfterMs: 5_000,
+    recommendedRefreshMs: 4_000,
+    pulseTyping: async (
+      target: FeedbackTarget,
+    ): Promise<FeedbackPulseResult> => {
+      if (!this.bot) return { ok: false, kind: 'unsupported' };
+
+      try {
+        const numericId = target.chatJid.replace(/^tg:/, '');
+        if (
+          target.telegramMessageThreadId !== undefined &&
+          target.telegramMessageThreadId !== null
+        ) {
+          await this.bot.api.sendChatAction(numericId, 'typing', {
+            message_thread_id: target.telegramMessageThreadId,
+          });
+        } else {
+          await this.bot.api.sendChatAction(numericId, 'typing');
+        }
+        return { ok: true };
+      } catch (err) {
+        logger.debug(
+          { jid: target.chatJid, err },
+          'Failed to send Telegram typing indicator',
+        );
+        return normalizeTelegramFeedbackError(err);
+      }
+    },
+  };
 
   constructor(botToken: string, opts: TelegramChannelOpts) {
     this.botToken = botToken;
@@ -635,16 +667,37 @@ export class TelegramChannel implements Channel {
       logger.info('Telegram bot stopped');
     }
   }
+}
 
-  async setTyping(jid: string, isTyping: boolean): Promise<void> {
-    if (!this.bot || !isTyping) return;
-    try {
-      const numericId = jid.replace(/^tg:/, '');
-      await this.bot.api.sendChatAction(numericId, 'typing');
-    } catch (err) {
-      logger.debug({ jid, err }, 'Failed to send Telegram typing indicator');
-    }
+function normalizeTelegramFeedbackError(error: unknown): FeedbackPulseResult {
+  const record =
+    error && typeof error === 'object'
+      ? (error as Record<string, unknown>)
+      : {};
+  const status = record.error_code ?? record.status ?? record.statusCode;
+  if (status === 429 || status === '429') {
+    const parameters =
+      record.parameters && typeof record.parameters === 'object'
+        ? (record.parameters as Record<string, unknown>)
+        : {};
+    const retryAfter =
+      readNumber(parameters.retry_after) ?? readNumber(record.retry_after);
+    return {
+      ok: false,
+      kind: 'rate_limited',
+      retryAfterMs: retryAfter === undefined ? undefined : retryAfter * 1000,
+      scope: 'channel',
+    };
   }
+
+  return { ok: false, kind: 'transient' };
+}
+
+function readNumber(value: unknown): number | undefined {
+  if (typeof value === 'number' && Number.isFinite(value)) return value;
+  if (typeof value !== 'string' || value.trim() === '') return undefined;
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : undefined;
 }
 
 registerChannel('telegram', (opts: ChannelOpts) => {

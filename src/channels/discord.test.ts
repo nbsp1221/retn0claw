@@ -765,10 +765,10 @@ describe('DiscordChannel', () => {
     });
   });
 
-  // --- setTyping ---
+  // --- feedback.pulseTyping ---
 
-  describe('setTyping', () => {
-    it('sends typing indicator when isTyping is true', async () => {
+  describe('feedback.pulseTyping', () => {
+    it('sends a one-shot typing pulse to the Discord channel', async () => {
       const opts = createTestOpts();
       const channel = new DiscordChannel('test-token', opts);
       await channel.connect();
@@ -779,30 +779,89 @@ describe('DiscordChannel', () => {
       };
       currentClient().channels.fetch.mockResolvedValue(mockChannel);
 
-      await channel.setTyping('dc:1234567890123456', true);
+      const result = await channel.feedback.pulseTyping({
+        chatJid: 'dc:1234567890123456',
+        runId: 'run-1',
+        turnId: 'turn-1',
+      });
 
-      expect(mockChannel.sendTyping).toHaveBeenCalled();
+      expect(result).toEqual({ ok: true });
+      expect(currentClient().channels.fetch).toHaveBeenCalledWith(
+        '1234567890123456',
+      );
+      expect(mockChannel.sendTyping).toHaveBeenCalledTimes(1);
     });
 
-    it('does nothing when isTyping is false', async () => {
+    it('uses the thread target when present', async () => {
       const opts = createTestOpts();
       const channel = new DiscordChannel('test-token', opts);
       await channel.connect();
+      const mockChannel = {
+        sendTyping: vi.fn().mockResolvedValue(undefined),
+      };
+      currentClient().channels.fetch.mockResolvedValue(mockChannel);
 
-      await channel.setTyping('dc:1234567890123456', false);
+      await channel.feedback.pulseTyping({
+        chatJid: 'dc:parent-channel',
+        threadId: 'dc:thread-channel',
+        runId: 'run-1',
+        turnId: 'turn-1',
+      });
 
-      // channels.fetch should NOT be called
-      expect(currentClient().channels.fetch).not.toHaveBeenCalled();
+      expect(currentClient().channels.fetch).toHaveBeenCalledWith(
+        'thread-channel',
+      );
     });
 
-    it('does nothing when client is not initialized', async () => {
+    it('reports unsupported when the client is not initialized', async () => {
       const opts = createTestOpts();
       const channel = new DiscordChannel('test-token', opts);
 
-      // Don't connect
-      await channel.setTyping('dc:1234567890123456', true);
+      const result = await channel.feedback.pulseTyping({
+        chatJid: 'dc:1234567890123456',
+        runId: 'run-1',
+        turnId: 'turn-1',
+      });
 
-      // No error
+      expect(result).toEqual({ ok: false, kind: 'unsupported' });
+    });
+
+    it('reports unsupported when the channel cannot send typing', async () => {
+      const opts = createTestOpts();
+      const channel = new DiscordChannel('test-token', opts);
+      await channel.connect();
+      currentClient().channels.fetch.mockResolvedValue({ send: vi.fn() });
+
+      const result = await channel.feedback.pulseTyping({
+        chatJid: 'dc:1234567890123456',
+        runId: 'run-1',
+        turnId: 'turn-1',
+      });
+
+      expect(result).toEqual({ ok: false, kind: 'unsupported' });
+    });
+
+    it('reports channel-scoped rate limits', async () => {
+      const opts = createTestOpts();
+      const channel = new DiscordChannel('test-token', opts);
+      await channel.connect();
+      currentClient().channels.fetch.mockRejectedValue({
+        status: 429,
+        retry_after: 2,
+      });
+
+      const result = await channel.feedback.pulseTyping({
+        chatJid: 'dc:1234567890123456',
+        runId: 'run-1',
+        turnId: 'turn-1',
+      });
+
+      expect(result).toEqual({
+        ok: false,
+        kind: 'rate_limited',
+        retryAfterMs: 2000,
+        scope: 'channel',
+      });
     });
   });
 
