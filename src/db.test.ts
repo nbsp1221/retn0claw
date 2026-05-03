@@ -8,12 +8,17 @@ import {
   getAllRegisteredGroups,
   getChatInfo,
   getLastBotMessageTimestamp,
+  getLastBotMessageSeq,
+  getMaxMessageSeqAtOrBeforeTimestamp,
+  getMessagesAfterSeq,
   getMessagesSince,
+  getNewMessagesBySeq,
   getNewMessages,
   getTaskById,
   setRegisteredGroup,
   storeChatMetadata,
   storeMessage,
+  storeMessageDirect,
   updateTask,
 } from './db.js';
 import { formatMessages } from './router.js';
@@ -140,6 +145,286 @@ describe('storeMessage', () => {
     );
     expect(messages).toHaveLength(1);
     expect(messages[0].content).toBe('updated');
+  });
+
+  it('assigns increasing seq values and preserves seq on duplicate delivery', () => {
+    storeChatMetadata('group@g.us', '2024-01-01T00:00:00.000Z');
+
+    store({
+      id: 'msg-1',
+      chat_jid: 'group@g.us',
+      sender: '123@s.whatsapp.net',
+      sender_name: 'Alice',
+      content: 'original',
+      timestamp: '2024-01-01T00:00:01.000Z',
+    });
+    store({
+      id: 'msg-2',
+      chat_jid: 'group@g.us',
+      sender: '456@s.whatsapp.net',
+      sender_name: 'Bob',
+      content: 'second',
+      timestamp: '2024-01-01T00:00:02.000Z',
+    });
+
+    const firstRead = getMessagesAfterSeq('group@g.us', 0, 'Andy', 10);
+    expect(firstRead.messages.map((message) => message.seq)).toEqual([1, 2]);
+
+    store({
+      id: 'msg-1',
+      chat_jid: 'group@g.us',
+      sender: '123@s.whatsapp.net',
+      sender_name: 'Alice',
+      content: 'updated',
+      timestamp: '2024-01-01T00:00:03.000Z',
+    });
+
+    const secondRead = getMessagesAfterSeq('group@g.us', 0, 'Andy', 10);
+    expect(secondRead.messages).toHaveLength(2);
+    expect(secondRead.messages[0]).toMatchObject({
+      id: 'msg-1',
+      content: 'updated',
+      seq: 1,
+    });
+    expect(secondRead.messages[1]).toMatchObject({
+      id: 'msg-2',
+      seq: 2,
+    });
+  });
+});
+
+describe('seq-based message accessors', () => {
+  beforeEach(() => {
+    storeChatMetadata('group@g.us', '2024-01-01T00:00:00.000Z');
+    storeChatMetadata('other@g.us', '2024-01-01T00:00:00.000Z');
+  });
+
+  it('returns oldest pending rows by seq and reports continuation', () => {
+    for (let i = 1; i <= 4; i++) {
+      store({
+        id: `seq-${i}`,
+        chat_jid: 'group@g.us',
+        sender: 'user@s.whatsapp.net',
+        sender_name: 'User',
+        content: `message ${i}`,
+        timestamp: `2024-01-01T00:00:0${i}.000Z`,
+      });
+    }
+
+    const firstBatch = getMessagesAfterSeq('group@g.us', 0, 'Andy', 2);
+    expect(firstBatch.messages.map((message) => message.content)).toEqual([
+      'message 1',
+      'message 2',
+    ]);
+    expect(firstBatch.hasMore).toBe(true);
+
+    const secondBatch = getMessagesAfterSeq(
+      'group@g.us',
+      firstBatch.messages[1].seq,
+      'Andy',
+      2,
+    );
+    expect(secondBatch.messages.map((message) => message.content)).toEqual([
+      'message 3',
+      'message 4',
+    ]);
+    expect(secondBatch.hasMore).toBe(false);
+  });
+
+  it('keeps seq accessors on the same message filters and reply metadata mapping', () => {
+    store({
+      id: 'user-1',
+      chat_jid: 'group@g.us',
+      sender: 'user@s.whatsapp.net',
+      sender_name: 'User',
+      content: 'visible',
+      timestamp: '2024-01-01T00:00:01.000Z',
+    });
+    storeMessage({
+      id: 'bot-flag',
+      chat_jid: 'group@g.us',
+      sender: 'bot',
+      sender_name: 'Bot',
+      content: 'bot reply',
+      timestamp: '2024-01-01T00:00:02.000Z',
+      is_bot_message: true,
+    });
+    store({
+      id: 'bot-prefix',
+      chat_jid: 'group@g.us',
+      sender: 'bot',
+      sender_name: 'Bot',
+      content: 'Andy: old bot reply',
+      timestamp: '2024-01-01T00:00:03.000Z',
+    });
+    store({
+      id: 'empty',
+      chat_jid: 'group@g.us',
+      sender: 'user@s.whatsapp.net',
+      sender_name: 'User',
+      content: '',
+      timestamp: '2024-01-01T00:00:04.000Z',
+    });
+    storeMessage({
+      id: 'reply',
+      chat_jid: 'group@g.us',
+      sender: 'user@s.whatsapp.net',
+      sender_name: 'User',
+      content: 'reply visible',
+      timestamp: '2024-01-01T00:00:05.000Z',
+      reply_to_is_bot: true,
+    });
+
+    const result = getMessagesAfterSeq('group@g.us', 0, 'Andy', 10);
+    expect(result.messages.map((message) => message.id)).toEqual([
+      'user-1',
+      'reply',
+    ]);
+    expect(result.messages[1].reply_to_is_bot).toBe(true);
+  });
+
+  it('advances getNewMessagesBySeq past permanently filtered rows', () => {
+    storeMessage({
+      id: 'bot-only',
+      chat_jid: 'group@g.us',
+      sender: 'bot',
+      sender_name: 'Bot',
+      content: 'bot reply',
+      timestamp: '2024-01-01T00:00:01.000Z',
+      is_bot_message: true,
+    });
+    store({
+      id: 'visible-other',
+      chat_jid: 'other@g.us',
+      sender: 'user@s.whatsapp.net',
+      sender_name: 'User',
+      content: 'visible in other',
+      timestamp: '2024-01-01T00:00:02.000Z',
+    });
+
+    const first = getNewMessagesBySeq(
+      ['group@g.us', 'other@g.us'],
+      0,
+      'Andy',
+      10,
+    );
+    expect(first.messages.map((message) => message.id)).toEqual([
+      'visible-other',
+    ]);
+    expect(first.newSeq).toBe(2);
+
+    const second = getNewMessagesBySeq(
+      ['group@g.us', 'other@g.us'],
+      first.newSeq,
+      'Andy',
+      10,
+    );
+    expect(second).toEqual({ messages: [], newSeq: 2 });
+  });
+
+  it('converts timestamp cursors to max seq at or before the timestamp', () => {
+    store({
+      id: 'before',
+      chat_jid: 'group@g.us',
+      sender: 'user@s.whatsapp.net',
+      sender_name: 'User',
+      content: 'before',
+      timestamp: '2024-01-01T00:00:01.000Z',
+    });
+    store({
+      id: 'tie-a',
+      chat_jid: 'group@g.us',
+      sender: 'user@s.whatsapp.net',
+      sender_name: 'User',
+      content: 'tie a',
+      timestamp: '2024-01-01T00:00:02.000Z',
+    });
+    store({
+      id: 'tie-b',
+      chat_jid: 'group@g.us',
+      sender: 'user@s.whatsapp.net',
+      sender_name: 'User',
+      content: 'tie b',
+      timestamp: '2024-01-01T00:00:02.000Z',
+    });
+    store({
+      id: 'after',
+      chat_jid: 'group@g.us',
+      sender: 'user@s.whatsapp.net',
+      sender_name: 'User',
+      content: 'after',
+      timestamp: '2024-01-01T00:00:03.000Z',
+    });
+
+    const seq = getMaxMessageSeqAtOrBeforeTimestamp(
+      '2024-01-01T00:00:02.000Z',
+      'group@g.us',
+    );
+    expect(seq).toBe(3);
+    expect(
+      getMessagesAfterSeq('group@g.us', seq ?? 0, 'Andy', 10).messages.map(
+        (message) => message.content,
+      ),
+    ).toEqual(['after']);
+  });
+
+  it('finds last bot message seq from flag or assistant prefix', () => {
+    store({
+      id: 'user-1',
+      chat_jid: 'group@g.us',
+      sender: 'user@s.whatsapp.net',
+      sender_name: 'User',
+      content: 'before bot',
+      timestamp: '2024-01-01T00:00:01.000Z',
+    });
+    storeMessage({
+      id: 'bot-flag',
+      chat_jid: 'group@g.us',
+      sender: 'bot',
+      sender_name: 'Bot',
+      content: 'flagged bot',
+      timestamp: '2024-01-01T00:00:02.000Z',
+      is_bot_message: true,
+    });
+    store({
+      id: 'bot-prefix',
+      chat_jid: 'group@g.us',
+      sender: 'bot',
+      sender_name: 'Bot',
+      content: 'Andy: prefix bot',
+      timestamp: '2024-01-01T00:00:03.000Z',
+    });
+
+    expect(getLastBotMessageSeq('group@g.us', 'Andy')).toBe(3);
+  });
+
+  it('storeMessageDirect also allocates and preserves seq', () => {
+    storeMessageDirect({
+      id: 'direct',
+      chat_jid: 'group@g.us',
+      sender: 'user@s.whatsapp.net',
+      sender_name: 'User',
+      content: 'original',
+      timestamp: '2024-01-01T00:00:01.000Z',
+      is_from_me: false,
+    });
+    storeMessageDirect({
+      id: 'direct',
+      chat_jid: 'group@g.us',
+      sender: 'user@s.whatsapp.net',
+      sender_name: 'User',
+      content: 'updated',
+      timestamp: '2024-01-01T00:00:02.000Z',
+      is_from_me: false,
+    });
+
+    const result = getMessagesAfterSeq('group@g.us', 0, 'Andy', 10);
+    expect(result.messages).toHaveLength(1);
+    expect(result.messages[0]).toMatchObject({
+      id: 'direct',
+      content: 'updated',
+      seq: 1,
+    });
   });
 });
 

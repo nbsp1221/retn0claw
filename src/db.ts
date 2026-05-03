@@ -31,12 +31,18 @@ function createSchema(database: Database.Database): void {
       sender_name TEXT,
       content TEXT,
       timestamp TEXT,
+      seq INTEGER,
       is_from_me INTEGER,
       is_bot_message INTEGER DEFAULT 0,
       PRIMARY KEY (id, chat_jid),
       FOREIGN KEY (chat_jid) REFERENCES chats(jid)
     );
     CREATE INDEX IF NOT EXISTS idx_timestamp ON messages(timestamp);
+
+    CREATE TABLE IF NOT EXISTS message_sequence (
+      id INTEGER PRIMARY KEY CHECK (id = 1),
+      next_seq INTEGER NOT NULL
+    );
 
     CREATE TABLE IF NOT EXISTS scheduled_tasks (
       id TEXT PRIMARY KEY,
@@ -121,6 +127,14 @@ function createSchema(database: Database.Database): void {
     /* column already exists */
   }
 
+  // Add durable message sequence if it doesn't exist (migration for existing DBs)
+  try {
+    database.exec(`ALTER TABLE messages ADD COLUMN seq INTEGER`);
+  } catch {
+    /* column already exists */
+  }
+  ensureMessageSequences(database);
+
   // Add is_main column if it doesn't exist (migration for existing DBs)
   try {
     database.exec(
@@ -186,6 +200,56 @@ function createSchema(database: Database.Database): void {
   } catch {
     /* column already exists */
   }
+}
+
+function ensureMessageSequences(database: Database.Database): void {
+  database.exec(`
+    CREATE TABLE IF NOT EXISTS message_sequence (
+      id INTEGER PRIMARY KEY CHECK (id = 1),
+      next_seq INTEGER NOT NULL
+    );
+  `);
+
+  const maxRow = database
+    .prepare(`SELECT MAX(seq) AS maxSeq FROM messages WHERE seq IS NOT NULL`)
+    .get() as { maxSeq: number | null } | undefined;
+  let nextSeq = (maxRow?.maxSeq ?? 0) + 1;
+
+  const rows = database
+    .prepare(
+      `SELECT rowid AS rowId FROM messages WHERE seq IS NULL ORDER BY timestamp, rowid`,
+    )
+    .all() as Array<{ rowId: number }>;
+  if (rows.length > 0) {
+    const update = database.prepare(
+      `UPDATE messages SET seq = ? WHERE rowid = ?`,
+    );
+    const backfill = database.transaction((items: Array<{ rowId: number }>) => {
+      for (const row of items) {
+        update.run(nextSeq, row.rowId);
+        nextSeq += 1;
+      }
+    });
+    backfill(rows);
+  }
+
+  const sequenceRow = database
+    .prepare(`SELECT next_seq AS nextSeq FROM message_sequence WHERE id = 1`)
+    .get() as { nextSeq: number } | undefined;
+  if (!sequenceRow) {
+    database
+      .prepare(`INSERT INTO message_sequence (id, next_seq) VALUES (1, ?)`)
+      .run(nextSeq);
+  } else if (sequenceRow.nextSeq < nextSeq) {
+    database
+      .prepare(`UPDATE message_sequence SET next_seq = ? WHERE id = 1`)
+      .run(nextSeq);
+  }
+
+  database.exec(`
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_messages_seq ON messages(seq) WHERE seq IS NOT NULL;
+    CREATE INDEX IF NOT EXISTS idx_messages_chat_seq ON messages(chat_jid, seq);
+  `);
 }
 
 export function initDatabase(): void {
@@ -353,22 +417,46 @@ export function setLastGroupSync(): void {
  * Only call this for registered groups where message history is needed.
  */
 export function storeMessage(msg: NewMessage): void {
-  db.prepare(
-    `INSERT OR REPLACE INTO messages (id, chat_jid, sender, sender_name, content, timestamp, is_from_me, is_bot_message, reply_to_message_id, reply_to_message_content, reply_to_sender_name, reply_to_is_bot) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-  ).run(
-    msg.id,
-    msg.chat_jid,
-    msg.sender,
-    msg.sender_name,
-    msg.content,
-    msg.timestamp,
-    msg.is_from_me ? 1 : 0,
-    msg.is_bot_message ? 1 : 0,
-    msg.reply_to_message_id ?? null,
-    msg.reply_to_message_content ?? null,
-    msg.reply_to_sender_name ?? null,
-    msg.reply_to_is_bot ? 1 : 0,
-  );
+  const write = db.transaction((message: NewMessage) => {
+    const seq =
+      getExistingMessageSeq(message.id, message.chat_jid) ?? nextMessageSeq();
+    db.prepare(
+      `
+      INSERT INTO messages (
+        id, chat_jid, sender, sender_name, content, timestamp, seq,
+        is_from_me, is_bot_message, reply_to_message_id,
+        reply_to_message_content, reply_to_sender_name, reply_to_is_bot
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(id, chat_jid) DO UPDATE SET
+        sender = excluded.sender,
+        sender_name = excluded.sender_name,
+        content = excluded.content,
+        timestamp = excluded.timestamp,
+        is_from_me = excluded.is_from_me,
+        is_bot_message = excluded.is_bot_message,
+        reply_to_message_id = excluded.reply_to_message_id,
+        reply_to_message_content = excluded.reply_to_message_content,
+        reply_to_sender_name = excluded.reply_to_sender_name,
+        reply_to_is_bot = excluded.reply_to_is_bot,
+        seq = COALESCE(messages.seq, excluded.seq)
+    `,
+    ).run(
+      message.id,
+      message.chat_jid,
+      message.sender,
+      message.sender_name,
+      message.content,
+      message.timestamp,
+      seq,
+      message.is_from_me ? 1 : 0,
+      message.is_bot_message ? 1 : 0,
+      message.reply_to_message_id ?? null,
+      message.reply_to_message_content ?? null,
+      message.reply_to_sender_name ?? null,
+      message.reply_to_is_bot ? 1 : 0,
+    );
+  });
+  write(msg);
 }
 
 /**
@@ -384,19 +472,108 @@ export function storeMessageDirect(msg: {
   is_from_me: boolean;
   is_bot_message?: boolean;
 }): void {
+  const write = db.transaction((message: typeof msg) => {
+    const seq =
+      getExistingMessageSeq(message.id, message.chat_jid) ?? nextMessageSeq();
+    db.prepare(
+      `
+      INSERT INTO messages (
+        id, chat_jid, sender, sender_name, content, timestamp, seq,
+        is_from_me, is_bot_message
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(id, chat_jid) DO UPDATE SET
+        sender = excluded.sender,
+        sender_name = excluded.sender_name,
+        content = excluded.content,
+        timestamp = excluded.timestamp,
+        is_from_me = excluded.is_from_me,
+        is_bot_message = excluded.is_bot_message,
+        seq = COALESCE(messages.seq, excluded.seq)
+    `,
+    ).run(
+      message.id,
+      message.chat_jid,
+      message.sender,
+      message.sender_name,
+      message.content,
+      message.timestamp,
+      seq,
+      message.is_from_me ? 1 : 0,
+      message.is_bot_message ? 1 : 0,
+    );
+  });
+  write(msg);
+}
+
+function getExistingMessageSeq(
+  id: string,
+  chatJid: string,
+): number | undefined {
+  const row = db
+    .prepare(`SELECT seq FROM messages WHERE id = ? AND chat_jid = ?`)
+    .get(id, chatJid) as { seq: number | null } | undefined;
+  return row?.seq ?? undefined;
+}
+
+function nextMessageSeq(): number {
+  const row = db
+    .prepare(`SELECT next_seq AS nextSeq FROM message_sequence WHERE id = 1`)
+    .get() as { nextSeq: number } | undefined;
+  const seq = row?.nextSeq ?? 1;
   db.prepare(
-    `INSERT OR REPLACE INTO messages (id, chat_jid, sender, sender_name, content, timestamp, is_from_me, is_bot_message) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-  ).run(
-    msg.id,
-    msg.chat_jid,
-    msg.sender,
-    msg.sender_name,
-    msg.content,
-    msg.timestamp,
-    msg.is_from_me ? 1 : 0,
-    msg.is_bot_message ? 1 : 0,
+    `
+    INSERT INTO message_sequence (id, next_seq) VALUES (1, ?)
+    ON CONFLICT(id) DO UPDATE SET next_seq = excluded.next_seq
+  `,
+  ).run(seq + 1);
+  return seq;
+}
+
+export type StoredMessage = NewMessage & { seq: number };
+
+type StoredMessageRow = Omit<
+  StoredMessage,
+  'content' | 'is_from_me' | 'is_bot_message' | 'reply_to_is_bot'
+> & {
+  content: string;
+  is_from_me: number | null;
+  reply_to_is_bot: number | null;
+};
+
+type RawMessageRow = Omit<StoredMessageRow, 'content'> & {
+  is_bot_message: number | null;
+  content: string | null;
+};
+
+function mapStoredMessage(row: StoredMessageRow): StoredMessage {
+  return {
+    ...row,
+    is_from_me: row.is_from_me === 1,
+    reply_to_is_bot: row.reply_to_is_bot === 1,
+  };
+}
+
+function isRouteVisibleMessage(
+  row: RawMessageRow,
+  botPrefix: string,
+): row is RawMessageRow & { content: string } {
+  return (
+    row.is_bot_message !== 1 &&
+    row.content !== null &&
+    row.content !== '' &&
+    !row.content.startsWith(`${botPrefix}:`)
   );
 }
+
+const STORED_MESSAGE_SELECT = `
+  id, chat_jid, sender, sender_name, content, timestamp, seq, is_from_me,
+  reply_to_message_id, reply_to_message_content, reply_to_sender_name,
+  reply_to_is_bot
+`;
+
+const RAW_MESSAGE_SELECT = `
+  ${STORED_MESSAGE_SELECT}, is_bot_message
+`;
 
 export function getNewMessages(
   jids: string[],
@@ -444,6 +621,40 @@ export function getNewMessages(
   };
 }
 
+export function getNewMessagesBySeq(
+  jids: string[],
+  lastSeq: number,
+  botPrefix: string,
+  limit: number = 200,
+): { messages: StoredMessage[]; newSeq: number } {
+  if (jids.length === 0) return { messages: [], newSeq: lastSeq };
+
+  const placeholders = jids.map(() => '?').join(',');
+  const rows = db
+    .prepare(
+      `
+      SELECT ${RAW_MESSAGE_SELECT}
+      FROM messages
+      WHERE seq > ? AND seq IS NOT NULL AND chat_jid IN (${placeholders})
+      ORDER BY seq ASC
+      LIMIT ?
+    `,
+    )
+    .all(lastSeq, ...jids, limit) as RawMessageRow[];
+
+  let newSeq = lastSeq;
+  for (const row of rows) {
+    if (row.seq > newSeq) newSeq = row.seq;
+  }
+
+  return {
+    messages: rows
+      .filter((row) => isRouteVisibleMessage(row, botPrefix))
+      .map(mapStoredMessage),
+    newSeq,
+  };
+}
+
 export function getMessagesSince(
   chatJid: string,
   sinceTimestamp: string,
@@ -477,6 +688,57 @@ export function getMessagesSince(
   }));
 }
 
+export function getMessagesAfterSeq(
+  chatJid: string,
+  afterSeq: number,
+  botPrefix: string,
+  limit: number = 200,
+): { messages: StoredMessage[]; hasMore: boolean } {
+  const rows = db
+    .prepare(
+      `
+      SELECT ${STORED_MESSAGE_SELECT}
+      FROM messages
+      WHERE chat_jid = ? AND seq > ? AND seq IS NOT NULL
+        AND is_bot_message = 0 AND content NOT LIKE ?
+        AND content != '' AND content IS NOT NULL
+      ORDER BY seq ASC
+      LIMIT ?
+    `,
+    )
+    .all(chatJid, afterSeq, `${botPrefix}:%`, limit + 1) as StoredMessageRow[];
+  return {
+    messages: rows.slice(0, limit).map(mapStoredMessage),
+    hasMore: rows.length > limit,
+  };
+}
+
+export function getMaxMessageSeqAtOrBeforeTimestamp(
+  timestamp: string,
+  chatJid?: string,
+): number | undefined {
+  const row = chatJid
+    ? (db
+        .prepare(
+          `
+          SELECT MAX(seq) AS seq
+          FROM messages
+          WHERE chat_jid = ? AND timestamp <= ? AND seq IS NOT NULL
+        `,
+        )
+        .get(chatJid, timestamp) as { seq: number | null } | undefined)
+    : (db
+        .prepare(
+          `
+          SELECT MAX(seq) AS seq
+          FROM messages
+          WHERE timestamp <= ? AND seq IS NOT NULL
+        `,
+        )
+        .get(timestamp) as { seq: number | null } | undefined);
+  return row?.seq ?? undefined;
+}
+
 export function getLastBotMessageTimestamp(
   chatJid: string,
   botPrefix: string,
@@ -488,6 +750,20 @@ export function getLastBotMessageTimestamp(
     )
     .get(chatJid, `${botPrefix}:%`) as { ts: string | null } | undefined;
   return row?.ts ?? undefined;
+}
+
+export function getLastBotMessageSeq(
+  chatJid: string,
+  botPrefix: string,
+): number | undefined {
+  const row = db
+    .prepare(
+      `SELECT MAX(seq) as seq FROM messages
+       WHERE chat_jid = ? AND seq IS NOT NULL
+         AND (is_bot_message = 1 OR content LIKE ?)`,
+    )
+    .get(chatJid, `${botPrefix}:%`) as { seq: number | null } | undefined;
+  return row?.seq ?? undefined;
 }
 
 export function createTask(

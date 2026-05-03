@@ -52,12 +52,18 @@ vi.mock('grammy', () => ({
 }));
 
 import {
+  getRouterState,
+  setRegisteredGroup,
+  setRouterState,
   _initTestDatabase,
   storeChatMetadata,
   storeMessage,
 } from '../../../src/db.js';
 import {
+  _enqueueMessageCheckForTests,
+  _loadStateForTests,
   _processGroupMessagesForTests,
+  _resetRouterStateForTests,
   _setChannelsForTests,
   _setRegisteredGroups,
   _setSessionsForTests,
@@ -121,6 +127,13 @@ function createTelegramTextCtx(overrides: {
   };
 }
 
+async function waitForRunnerCalls(count: number): Promise<void> {
+  for (let i = 0; i < 20; i++) {
+    if (vi.mocked(runCodexAgent).mock.calls.length >= count) return;
+    await new Promise((resolve) => setTimeout(resolve, 0));
+  }
+}
+
 async function triggerTelegramText(
   ctx: ReturnType<typeof createTelegramTextCtx>,
 ) {
@@ -136,6 +149,7 @@ describe('orchestration integration: chat surface routing', () => {
     _initTestDatabase();
     _setRegisteredGroups({ 'tg:-100': testGroup });
     _setSessionsForTests({});
+    _resetRouterStateForTests();
     _setChannelsForTests([createChannel() as any]);
     vi.clearAllMocks();
 
@@ -190,6 +204,248 @@ describe('orchestration integration: chat surface routing', () => {
     expect(prompt).not.toContain('@Andy @retn0testerbot 안녕?');
     expect(prompt).not.toContain('사과는 맛있지');
     expect(prompt).not.toContain('바나나도 먹을까?');
+  });
+
+  it('does not lose an addressed request when later unaddressed chatter exceeds the prompt cap', async () => {
+    const chatJid = 'tg:-burst';
+    _setRegisteredGroups({ [chatJid]: testGroup });
+    _setChannelsForTests([createChannel(chatJid) as any]);
+    storeChatMetadata(
+      chatJid,
+      '2026-04-24T00:00:00.000Z',
+      '루나방',
+      'telegram',
+      true,
+    );
+
+    storeMessage({
+      id: 'addressed',
+      chat_jid: chatJid,
+      sender: 'bob',
+      sender_name: 'Bob',
+      content: '@Andy 오래된 요청을 처리해줘',
+      timestamp: '2026-04-24T00:00:01.000Z',
+    });
+    for (let i = 1; i <= 12; i++) {
+      storeMessage({
+        id: `chatter-${i}`,
+        chat_jid: chatJid,
+        sender: 'alice',
+        sender_name: 'Alice',
+        content: `잡담 ${i}`,
+        timestamp: `2026-04-24T00:00:${String(i + 1).padStart(2, '0')}.000Z`,
+      });
+    }
+
+    await expect(_processGroupMessagesForTests(chatJid)).resolves.toBe(true);
+
+    expect(runCodexAgent).toHaveBeenCalledTimes(1);
+    const prompt = vi.mocked(runCodexAgent).mock.calls[0]?.[1].prompt;
+    expect(prompt.match(/<latest_message\b/g)).toHaveLength(1);
+    expect(prompt).toContain('오래된 요청을 처리해줘');
+    expect(prompt).not.toContain('잡담 12');
+  });
+
+  it('does not lose an older reply-to-bot request behind later chatter', async () => {
+    const chatJid = 'tg:-reply-burst';
+    _setRegisteredGroups({ [chatJid]: testGroup });
+    _setChannelsForTests([createChannel(chatJid) as any]);
+    storeChatMetadata(
+      chatJid,
+      '2026-04-24T00:00:00.000Z',
+      '루나방',
+      'telegram',
+      true,
+    );
+
+    storeMessage({
+      id: 'reply-addressed',
+      chat_jid: chatJid,
+      sender: 'bob',
+      sender_name: 'Bob',
+      content: '이 답변을 더 자세히 설명해줘',
+      timestamp: '2026-04-24T00:00:01.000Z',
+      reply_to_message_id: 'bot-1',
+      reply_to_message_content: '요약 답변',
+      reply_to_sender_name: 'Andy',
+      reply_to_is_bot: true,
+    });
+    for (let i = 1; i <= 12; i++) {
+      storeMessage({
+        id: `reply-chatter-${i}`,
+        chat_jid: chatJid,
+        sender: 'alice',
+        sender_name: 'Alice',
+        content: `다른 대화 ${i}`,
+        timestamp: `2026-04-24T00:00:${String(i + 1).padStart(2, '0')}.000Z`,
+      });
+    }
+
+    await expect(_processGroupMessagesForTests(chatJid)).resolves.toBe(true);
+
+    expect(runCodexAgent).toHaveBeenCalledTimes(1);
+    const prompt = vi.mocked(runCodexAgent).mock.calls[0]?.[1].prompt;
+    expect(prompt).toContain('<addressed_by>reply_to_bot</addressed_by>');
+    expect(prompt).toContain('이 답변을 더 자세히 설명해줘');
+  });
+
+  it('queues continuation past an unaddressed batch to find a later addressed request', async () => {
+    const chatJid = 'tg:-continuation';
+    _setRegisteredGroups({ [chatJid]: testGroup });
+    _setChannelsForTests([createChannel(chatJid) as any]);
+    storeChatMetadata(
+      chatJid,
+      '2026-04-24T00:00:00.000Z',
+      '루나방',
+      'telegram',
+      true,
+    );
+
+    for (let i = 1; i <= 12; i++) {
+      storeMessage({
+        id: `before-addressed-${i}`,
+        chat_jid: chatJid,
+        sender: 'alice',
+        sender_name: 'Alice',
+        content: `앞선 잡담 ${i}`,
+        timestamp: `2026-04-24T00:00:${String(i).padStart(2, '0')}.000Z`,
+      });
+    }
+    storeMessage({
+      id: 'later-addressed',
+      chat_jid: chatJid,
+      sender: 'bob',
+      sender_name: 'Bob',
+      content: '@Andy 나중 요청을 처리해줘',
+      timestamp: '2026-04-24T00:00:13.000Z',
+    });
+
+    _enqueueMessageCheckForTests(chatJid);
+    await waitForRunnerCalls(1);
+
+    expect(runCodexAgent).toHaveBeenCalledTimes(1);
+    const prompt = vi.mocked(runCodexAgent).mock.calls[0]?.[1].prompt;
+    expect(prompt).toContain('나중 요청을 처리해줘');
+  });
+
+  it('does not re-route duplicate delivery after the original addressed message was processed', async () => {
+    const chatJid = 'tg:-duplicate-redelivery';
+    _setRegisteredGroups({ [chatJid]: testGroup });
+    _setChannelsForTests([createChannel(chatJid) as any]);
+    storeChatMetadata(
+      chatJid,
+      '2026-04-24T00:00:00.000Z',
+      '루나방',
+      'telegram',
+      true,
+    );
+
+    storeMessage({
+      id: 'same-message',
+      chat_jid: chatJid,
+      sender: 'bob',
+      sender_name: 'Bob',
+      content: '@Andy 첫 요청',
+      timestamp: '2026-04-24T00:00:01.000Z',
+    });
+
+    await expect(_processGroupMessagesForTests(chatJid)).resolves.toBe(true);
+    expect(runCodexAgent).toHaveBeenCalledTimes(1);
+
+    storeMessage({
+      id: 'same-message',
+      chat_jid: chatJid,
+      sender: 'bob',
+      sender_name: 'Bob',
+      content: '@Andy 수정된 재전달',
+      timestamp: '2026-04-24T00:00:09.000Z',
+    });
+
+    await expect(_processGroupMessagesForTests(chatJid)).resolves.toBe(true);
+    expect(runCodexAgent).toHaveBeenCalledTimes(1);
+  });
+
+  it('keeps legacy timestamp cursor monotonic when seq order sees delayed timestamps', async () => {
+    const chatJid = 'tg:-delayed-timestamp';
+    _setRegisteredGroups({ [chatJid]: testGroup });
+    _setChannelsForTests([createChannel(chatJid) as any]);
+    storeChatMetadata(
+      chatJid,
+      '2026-04-24T00:00:00.000Z',
+      '루나방',
+      'telegram',
+      true,
+    );
+
+    storeMessage({
+      id: 'newer-time',
+      chat_jid: chatJid,
+      sender: 'bob',
+      sender_name: 'Bob',
+      content: '@Andy 먼저 들어온 최신 timestamp',
+      timestamp: '2026-04-24T00:00:10.000Z',
+    });
+    await expect(_processGroupMessagesForTests(chatJid)).resolves.toBe(true);
+
+    storeMessage({
+      id: 'older-time-late',
+      chat_jid: chatJid,
+      sender: 'bob',
+      sender_name: 'Bob',
+      content: '@Andy 늦게 들어온 과거 timestamp',
+      timestamp: '2026-04-24T00:00:05.000Z',
+    });
+    await expect(_processGroupMessagesForTests(chatJid)).resolves.toBe(true);
+
+    expect(JSON.parse(getRouterState('last_agent_timestamp') ?? '{}')).toEqual({
+      [chatJid]: '2026-04-24T00:00:10.000Z',
+    });
+  });
+
+  it('migrates legacy timestamp router state to seq without replaying handled history', async () => {
+    const chatJid = 'tg:-legacy-state';
+    const group = { ...testGroup, folder: 'legacy-state-room' };
+    setRegisteredGroup(chatJid, group);
+    _setChannelsForTests([createChannel(chatJid) as any]);
+    storeChatMetadata(
+      chatJid,
+      '2026-04-24T00:00:00.000Z',
+      '루나방',
+      'telegram',
+      true,
+    );
+    storeMessage({
+      id: 'already-handled',
+      chat_jid: chatJid,
+      sender: 'alice',
+      sender_name: 'Alice',
+      content: '@Andy 이미 처리된 요청',
+      timestamp: '2026-04-24T00:00:01.000Z',
+    });
+    storeMessage({
+      id: 'pending-after-legacy',
+      chat_jid: chatJid,
+      sender: 'bob',
+      sender_name: 'Bob',
+      content: '@Andy 새 요청',
+      timestamp: '2026-04-24T00:00:02.000Z',
+    });
+    setRouterState(
+      'last_agent_timestamp',
+      JSON.stringify({
+        [chatJid]: '2026-04-24T00:00:01.000Z',
+      }),
+    );
+
+    _loadStateForTests();
+    _setChannelsForTests([createChannel(chatJid) as any]);
+
+    await expect(_processGroupMessagesForTests(chatJid)).resolves.toBe(true);
+
+    expect(runCodexAgent).toHaveBeenCalledTimes(1);
+    const prompt = vi.mocked(runCodexAgent).mock.calls[0]?.[1].prompt;
+    expect(prompt).toContain('새 요청');
+    expect(prompt).not.toContain('이미 처리된 요청');
   });
 
   it('allows a registered DM to invoke Codex without a trigger', async () => {

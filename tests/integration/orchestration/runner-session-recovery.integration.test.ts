@@ -23,6 +23,7 @@ import {
 } from '../../../src/runners/shared/runner-session-store.js';
 import {
   _processGroupMessagesForTests,
+  _resetRouterStateForTests,
   _setChannelsForTests,
   _setRegisteredGroups,
   _setSessionsForTests,
@@ -63,6 +64,7 @@ describe('orchestration integration: runner session recovery', () => {
     _initTestDatabase();
     _setRegisteredGroups({ 'test@g.us': testGroup });
     _setSessionsForTests({});
+    _resetRouterStateForTests();
     vi.clearAllMocks();
 
     storeChatMetadata(

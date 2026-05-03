@@ -22,6 +22,7 @@ import {
   _processGroupMessagesForTests,
   _processMessageLoopGroupMessagesForTests,
   _resetFeedbackControllerForTests,
+  _resetRouterStateForTests,
   _setChannelsForTests,
   _setFeedbackControllerForTests,
   _setRegisteredGroups,
@@ -68,6 +69,7 @@ describe('orchestration integration: queued follow-up', () => {
     _initTestDatabase();
     _setRegisteredGroups({ 'test@g.us': testGroup });
     _setSessionsForTests({});
+    _resetRouterStateForTests();
     vi.clearAllMocks();
 
     storeChatMetadata(
@@ -158,6 +160,52 @@ describe('orchestration integration: queued follow-up', () => {
     expect(channel.sendMessage).toHaveBeenCalledTimes(2);
   });
 
+  it('routes an older legacy trigger even when later chatter exceeds the prompt cap', async () => {
+    const channel = createChannel();
+    _setChannelsForTests([channel as any]);
+    _setRegisteredGroups({
+      'test@g.us': {
+        ...testGroup,
+        requiresTrigger: true,
+      },
+    });
+    vi.mocked(runContainerAgent).mockResolvedValue({
+      status: 'success',
+      result: 'ok',
+      newSessionId: 'thread-1',
+    });
+
+    storeMessage({
+      id: 'legacy-trigger',
+      chat_jid: 'test@g.us',
+      sender: 'user-1',
+      sender_name: 'retn0',
+      content: '@Andy 오래된 legacy 요청',
+      timestamp: '2026-04-23T00:00:01.000Z',
+      is_from_me: false,
+    });
+    for (let i = 1; i <= 12; i++) {
+      storeMessage({
+        id: `legacy-chatter-${i}`,
+        chat_jid: 'test@g.us',
+        sender: 'user-2',
+        sender_name: 'Other',
+        content: `legacy 잡담 ${i}`,
+        timestamp: `2026-04-23T00:00:${String(i + 1).padStart(2, '0')}.000Z`,
+        is_from_me: false,
+      });
+    }
+
+    await expect(_processGroupMessagesForTests('test@g.us')).resolves.toBe(
+      true,
+    );
+
+    expect(runContainerAgent).toHaveBeenCalledTimes(1);
+    expect(vi.mocked(runContainerAgent).mock.calls[0]?.[1].prompt).toContain(
+      '오래된 legacy 요청',
+    );
+  });
+
   it('routes accepted active-runtime follow-ups through the message-loop branch', async () => {
     vi.useFakeTimers();
     const pulseTyping = vi.fn(
@@ -237,6 +285,7 @@ describe('orchestration integration: queued follow-up', () => {
       sendActiveRuntimeMessage,
     });
     await vi.advanceTimersByTimeAsync(1);
+    expect(sendActiveRuntimeMessage).toHaveBeenCalledTimes(1);
     expect(pulseTyping).toHaveBeenCalledTimes(1);
 
     await vi.advanceTimersByTimeAsync(8_000);

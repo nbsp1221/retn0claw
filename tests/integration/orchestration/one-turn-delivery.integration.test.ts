@@ -20,6 +20,7 @@ import {
 import {
   _processGroupMessagesForTests,
   _resetFeedbackControllerForTests,
+  _resetRouterStateForTests,
   _setChannelsForTests,
   _setRegisteredGroups,
   _setSessionsForTests,
@@ -60,6 +61,7 @@ describe('orchestration integration: one turn delivery', () => {
     _initTestDatabase();
     _setRegisteredGroups({ 'test@g.us': testGroup });
     _setSessionsForTests({});
+    _resetRouterStateForTests();
     vi.clearAllMocks();
 
     storeChatMetadata(

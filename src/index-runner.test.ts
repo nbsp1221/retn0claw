@@ -18,17 +18,13 @@ vi.mock('./runners/shared/runner-artifacts.js', () => ({
 }));
 
 import { _initTestDatabase, setSession, storeChatMetadata } from './db.js';
-import {
-  getRunnerSession,
-  setRunnerSession,
-} from './runners/shared/runner-session-store.js';
+import { getRunnerSession } from './runners/shared/runner-session-store.js';
 import {
   _runAgentForTests,
   _setRegisteredGroups,
   _setSessionsForTests,
 } from './index.js';
 import { runContainerAgent } from './runners/claude/container-runner.js';
-import { runCodexAgent } from './runners/codex/codex-runner.js';
 
 const testGroup = {
   name: 'Test Group',

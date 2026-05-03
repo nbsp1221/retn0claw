@@ -41,6 +41,7 @@ export function readCodexOAuthTokens(): CodexOAuthTokens {
   } catch (error) {
     throw new Error(
       `Failed to read CODEX_OAUTH_TOKEN_STORE_PATH at ${authPath}: ${error instanceof Error ? error.message : String(error)}`,
+      { cause: error },
     );
   }
 

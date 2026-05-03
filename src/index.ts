@@ -38,14 +38,17 @@ import {
   getAllTasks,
   getChatInfo,
   getLastBotMessageTimestamp,
-  getMessagesSince,
-  getNewMessages,
+  getLastBotMessageSeq,
+  getMaxMessageSeqAtOrBeforeTimestamp,
+  getMessagesAfterSeq,
+  getNewMessagesBySeq,
   getRouterState,
   initDatabase,
   setRegisteredGroup,
   setRouterState,
   storeChatMetadata,
   storeMessage,
+  type StoredMessage,
 } from './db.js';
 import { GroupQueue } from './group-queue.js';
 import { resolveGroupFolderPath } from './group-folder.js';
@@ -98,9 +101,11 @@ import type { FeedbackTarget } from './feedback/types.js';
 export { escapeXml, formatMessages } from './router.js';
 
 let lastTimestamp = '';
+let lastMessageSeq = 0;
 let sessions: Record<string, string> = {};
 let registeredGroups: Record<string, RegisteredGroup> = {};
 let lastAgentTimestamp: Record<string, string> = {};
+let lastAgentSeq: Record<string, number> = {};
 let messageLoopRunning = false;
 
 const channels: Channel[] = [];
@@ -132,12 +137,24 @@ function ensureOneCLIAgent(jid: string, group: RegisteredGroup): void {
 
 function loadState(): void {
   lastTimestamp = getRouterState('last_timestamp') || '';
+  lastMessageSeq = parseCursorSeq(getRouterState('last_message_seq'));
+  if (lastMessageSeq === 0 && lastTimestamp) {
+    lastMessageSeq =
+      getMaxMessageSeqAtOrBeforeTimestamp(lastTimestamp) ?? lastMessageSeq;
+  }
+
   const agentTs = getRouterState('last_agent_timestamp');
   try {
     lastAgentTimestamp = agentTs ? JSON.parse(agentTs) : {};
   } catch {
     logger.warn('Corrupted last_agent_timestamp in DB, resetting');
     lastAgentTimestamp = {};
+  }
+  lastAgentSeq = parseAgentSeqState(getRouterState('last_agent_seq'));
+  for (const [chatJid, timestamp] of Object.entries(lastAgentTimestamp)) {
+    if (lastAgentSeq[chatJid] !== undefined) continue;
+    const seq = getMaxMessageSeqAtOrBeforeTimestamp(timestamp, chatJid);
+    if (seq !== undefined) lastAgentSeq[chatJid] = seq;
   }
   const runnerKind = getSelectedRunnerKind();
   sessions = getRunnerSessions(runnerKind);
@@ -148,30 +165,106 @@ function loadState(): void {
   );
 }
 
+function parseCursorSeq(value: string | null | undefined): number {
+  if (!value) return 0;
+  const parsed = Number(value);
+  return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : 0;
+}
+
+function parseAgentSeqState(
+  value: string | null | undefined,
+): Record<string, number> {
+  if (!value) return {};
+  try {
+    const raw = JSON.parse(value) as Record<string, unknown>;
+    const parsed: Record<string, number> = {};
+    for (const [chatJid, seq] of Object.entries(raw)) {
+      if (typeof seq !== 'number') continue;
+      if (Number.isSafeInteger(seq) && seq >= 0) parsed[chatJid] = seq;
+    }
+    return parsed;
+  } catch {
+    logger.warn('Corrupted last_agent_seq in DB, resetting');
+    return {};
+  }
+}
+
+function lastMessageTimestamp(messages: NewMessage[]): string | null {
+  return messages.length > 0 ? messages[messages.length - 1].timestamp : null;
+}
+
+function advanceAgentCursor(
+  chatJid: string,
+  seq: number,
+  timestamp: string,
+): void {
+  lastAgentSeq[chatJid] = seq;
+  const previousTimestamp = lastAgentTimestamp[chatJid];
+  lastAgentTimestamp[chatJid] =
+    previousTimestamp && previousTimestamp > timestamp
+      ? previousTimestamp
+      : timestamp;
+  saveState();
+}
+
 /**
  * Return the message cursor for a group, recovering from the last bot reply
  * if lastAgentTimestamp is missing (new group, corrupted state, restart).
  */
-function getOrRecoverCursor(chatJid: string): string {
-  const existing = lastAgentTimestamp[chatJid];
-  if (existing) return existing;
+function getOrRecoverMessageSeq(chatJid: string): number {
+  const existing = lastAgentSeq[chatJid];
+  if (existing !== undefined) return existing;
 
-  const botTs = getLastBotMessageTimestamp(chatJid, ASSISTANT_NAME);
-  if (botTs) {
+  const legacyTimestamp = lastAgentTimestamp[chatJid];
+  if (legacyTimestamp) {
+    const seq = getMaxMessageSeqAtOrBeforeTimestamp(legacyTimestamp, chatJid);
+    if (seq !== undefined) {
+      lastAgentSeq[chatJid] = seq;
+      saveState();
+      return seq;
+    }
+  }
+
+  const botSeq = getLastBotMessageSeq(chatJid, ASSISTANT_NAME);
+  if (botSeq !== undefined) {
+    const botTs = getLastBotMessageTimestamp(chatJid, ASSISTANT_NAME);
     logger.info(
-      { chatJid, recoveredFrom: botTs },
+      { chatJid, recoveredFromSeq: botSeq, recoveredFromTimestamp: botTs },
       'Recovered message cursor from last bot reply',
     );
-    lastAgentTimestamp[chatJid] = botTs;
+    lastAgentSeq[chatJid] = botSeq;
+    if (botTs) lastAgentTimestamp[chatJid] = botTs;
     saveState();
-    return botTs;
+    return botSeq;
   }
-  return '';
+  return 0;
 }
 
 function saveState(): void {
   setRouterState('last_timestamp', lastTimestamp);
+  setRouterState('last_message_seq', String(lastMessageSeq));
   setRouterState('last_agent_timestamp', JSON.stringify(lastAgentTimestamp));
+  setRouterState('last_agent_seq', JSON.stringify(lastAgentSeq));
+}
+
+/** @internal - exported for testing */
+export function _resetRouterStateForTests(): void {
+  lastTimestamp = '';
+  lastMessageSeq = 0;
+  lastAgentTimestamp = {};
+  lastAgentSeq = {};
+  saveState();
+}
+
+/** @internal - exported for testing */
+export function _loadStateForTests(): void {
+  loadState();
+}
+
+/** @internal - exported for testing */
+export function _enqueueMessageCheckForTests(chatJid: string): void {
+  queue.setProcessMessagesFn(processGroupMessages);
+  queue.enqueueMessageCheck(chatJid);
 }
 
 function registerGroup(jid: string, group: RegisteredGroup): void {
@@ -423,14 +516,18 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
     return true;
   }
 
-  const missedMessages = getMessagesSince(
+  const pending = getMessagesAfterSeq(
     chatJid,
-    getOrRecoverCursor(chatJid),
+    getOrRecoverMessageSeq(chatJid),
     ASSISTANT_NAME,
     MAX_MESSAGES_PER_PROMPT,
   );
+  const missedMessages = pending.messages;
 
   if (missedMessages.length === 0) return true;
+  const evaluatedSeq = missedMessages[missedMessages.length - 1].seq;
+  const evaluatedTimestamp =
+    missedMessages[missedMessages.length - 1].timestamp;
 
   const builtPrompt = buildRunnerPrompt({
     chatJid,
@@ -439,22 +536,22 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
     runnerKind: getSelectedRunnerKind(),
   });
   if (!builtPrompt.prompt) {
-    if (builtPrompt.cursorTimestamp) {
-      lastAgentTimestamp[chatJid] = builtPrompt.cursorTimestamp;
-      saveState();
-    }
+    advanceAgentCursor(
+      chatJid,
+      evaluatedSeq,
+      builtPrompt.cursorTimestamp ?? evaluatedTimestamp,
+    );
+    if (pending.hasMore) queue.enqueueMessageCheck(chatJid);
     return true;
   }
   const prompt = builtPrompt.prompt;
-  const cursorTimestamp =
-    builtPrompt.cursorTimestamp ??
-    missedMessages[missedMessages.length - 1].timestamp;
+  const cursorTimestamp = builtPrompt.cursorTimestamp ?? evaluatedTimestamp;
 
   // Advance cursor so the piping path in startMessageLoop won't re-fetch
   // these messages. Save the old cursor so we can roll back on error.
+  const previousSeq = lastAgentSeq[chatJid] ?? 0;
   const previousCursor = lastAgentTimestamp[chatJid] || '';
-  lastAgentTimestamp[chatJid] = cursorTimestamp;
-  saveState();
+  advanceAgentCursor(chatJid, evaluatedSeq, cursorTimestamp);
 
   logger.info(
     { group: group.name, messageCount: missedMessages.length },
@@ -588,10 +685,16 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
         { group: group.name },
         'Agent error after output was sent, skipping cursor rollback to prevent duplicates',
       );
+      if (pending.hasMore) queue.enqueueMessageCheck(chatJid);
       return true;
     }
     // Roll back cursor so retries can re-process these messages
-    lastAgentTimestamp[chatJid] = previousCursor;
+    lastAgentSeq[chatJid] = previousSeq;
+    if (previousCursor) {
+      lastAgentTimestamp[chatJid] = previousCursor;
+    } else {
+      delete lastAgentTimestamp[chatJid];
+    }
     saveState();
     logger.warn(
       { group: group.name },
@@ -600,6 +703,7 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
     return false;
   }
 
+  if (pending.hasMore) queue.enqueueMessageCheck(chatJid);
   return true;
 }
 
@@ -721,7 +825,7 @@ interface MessageLoopGroupMessagesInput {
 
 function processMessageLoopGroupMessages({
   chatJid,
-  groupMessages,
+  groupMessages: _groupMessages,
   sendActiveRuntimeMessage,
 }: MessageLoopGroupMessagesInput): void {
   const group = registeredGroups[chatJid];
@@ -737,34 +841,50 @@ function processMessageLoopGroupMessages({
   const needsTrigger = !isMainGroup && group.requiresTrigger !== false;
   const runnerKindForPrompt = getSelectedRunnerKind();
 
+  const pending = getMessagesAfterSeq(
+    chatJid,
+    getOrRecoverMessageSeq(chatJid),
+    ASSISTANT_NAME,
+    MAX_MESSAGES_PER_PROMPT,
+  );
+  const allPending = pending.messages;
+  const messagesToSend = allPending;
+  if (messagesToSend.length === 0) return;
+
   if (needsTrigger && runnerKindForPrompt !== 'codex') {
-    if (!hasAllowedLegacyTrigger(chatJid, group, groupMessages)) {
+    if (!hasAllowedLegacyTrigger(chatJid, group, messagesToSend)) {
+      if (allPending.length > 0) {
+        const last = allPending[allPending.length - 1];
+        advanceAgentCursor(chatJid, last.seq, last.timestamp);
+        if (pending.hasMore) queue.enqueueMessageCheck(chatJid);
+      }
       return;
     }
   }
 
-  const allPending = getMessagesSince(
-    chatJid,
-    getOrRecoverCursor(chatJid),
-    ASSISTANT_NAME,
-    MAX_MESSAGES_PER_PROMPT,
-  );
-  const messagesToSend = allPending.length > 0 ? allPending : groupMessages;
   const builtPrompt = buildRunnerPrompt({
     chatJid,
     group,
     messages: messagesToSend,
     runnerKind: runnerKindForPrompt,
-    legacyTriggerMessages: groupMessages,
+    legacyTriggerMessages: messagesToSend,
   });
   if (!builtPrompt.prompt) {
-    if (builtPrompt.cursorTimestamp) {
-      lastAgentTimestamp[chatJid] = builtPrompt.cursorTimestamp;
-      saveState();
+    if (allPending.length > 0) {
+      const last = allPending[allPending.length - 1];
+      advanceAgentCursor(
+        chatJid,
+        last.seq,
+        builtPrompt.cursorTimestamp ?? last.timestamp,
+      );
+      if (pending.hasMore) queue.enqueueMessageCheck(chatJid);
     }
     return;
   }
   const formatted = builtPrompt.prompt;
+  const evaluatedLast = allPending[allPending.length - 1] as
+    | StoredMessage
+    | undefined;
   const cursorTimestamp =
     builtPrompt.cursorTimestamp ??
     messagesToSend[messagesToSend.length - 1].timestamp;
@@ -781,8 +901,10 @@ function processMessageLoopGroupMessages({
       { chatJid, count: messagesToSend.length },
       'Piped messages to active container',
     );
-    lastAgentTimestamp[chatJid] = cursorTimestamp;
-    saveState();
+    if (evaluatedLast) {
+      advanceAgentCursor(chatJid, evaluatedLast.seq, cursorTimestamp);
+      if (pending.hasMore) queue.enqueueMessageCheck(chatJid);
+    }
   } else {
     queue.enqueueMessageCheck(chatJid);
   }
@@ -803,18 +925,21 @@ async function startMessageLoop(): Promise<void> {
   while (true) {
     try {
       const jids = Object.keys(registeredGroups);
-      const { messages, newTimestamp } = getNewMessages(
+      const { messages, newSeq } = getNewMessagesBySeq(
         jids,
-        lastTimestamp,
+        lastMessageSeq,
         ASSISTANT_NAME,
       );
+      const timestamp = lastMessageTimestamp(messages);
+
+      if (newSeq > lastMessageSeq) {
+        lastMessageSeq = newSeq;
+        if (timestamp && timestamp > lastTimestamp) lastTimestamp = timestamp;
+        saveState();
+      }
 
       if (messages.length > 0) {
         logger.info({ count: messages.length }, 'New messages');
-
-        // Advance the "seen" cursor for all messages immediately
-        lastTimestamp = newTimestamp;
-        saveState();
 
         // Deduplicate by group
         const messagesByGroup = new Map<string, NewMessage[]>();
@@ -844,15 +969,15 @@ async function startMessageLoop(): Promise<void> {
  */
 function recoverPendingMessages(): void {
   for (const [chatJid, group] of Object.entries(registeredGroups)) {
-    const pending = getMessagesSince(
+    const pending = getMessagesAfterSeq(
       chatJid,
-      getOrRecoverCursor(chatJid),
+      getOrRecoverMessageSeq(chatJid),
       ASSISTANT_NAME,
-      MAX_MESSAGES_PER_PROMPT,
+      1,
     );
-    if (pending.length > 0) {
+    if (pending.messages.length > 0) {
       logger.info(
-        { group: group.name, pendingCount: pending.length },
+        { group: group.name, pendingCount: pending.messages.length },
         'Recovery: found unprocessed messages',
       );
       queue.enqueueMessageCheck(chatJid);

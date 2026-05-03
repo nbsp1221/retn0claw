@@ -19,6 +19,7 @@ import {
 } from '../../../src/db.js';
 import {
   _processGroupMessagesForTests,
+  _resetRouterStateForTests,
   _setChannelsForTests,
   _setRegisteredGroups,
   _setSessionsForTests,
@@ -59,6 +60,7 @@ describe('orchestration integration: multi-turn same runtime', () => {
     _initTestDatabase();
     _setRegisteredGroups({ 'test@g.us': testGroup });
     _setSessionsForTests({});
+    _resetRouterStateForTests();
     vi.clearAllMocks();
 
     storeChatMetadata(
